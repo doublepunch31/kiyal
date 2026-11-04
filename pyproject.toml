@@ -3,6 +3,8 @@ name = "kiyal"
 version = "0.1.0.dev0"
 description = "LLM inference engine and OpenAI-compatible server, built from scratch in PyTorch."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "numpy>=2.5.4",
