@@ -4,7 +4,14 @@ version = "0.1.0.dev0"
 description = "LLM inference engine and OpenAI-compatible server, built from scratch in PyTorch."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-dependencies = []
+dependencies = [
+    "numpy>=2.5.4",
+]
+
+# torch is installed through an extra so each machine picks its build:
+# `uv sync --extra cpu` for CPU and Apple Silicon.
+[project.optional-dependencies]
+cpu = ["torch>=2.15,<3"]
 
 [project.scripts]
 kiyal = "kiyal.cli:main"
@@ -12,6 +19,16 @@ kiyal = "kiyal.cli:main"
 [build-system]
 requires = ["uv_build>=0.9.24,<0.14"]
 build-backend = "uv_build"
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", extra = "cpu" }]
+
+# The CPU-only build skips the CUDA libraries that the default Linux
+# wheel on PyPI pulls in. Its macOS wheel is the same MPS-enabled build.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.ruff]
 line-length = 100
