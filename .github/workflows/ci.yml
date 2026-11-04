@@ -19,8 +19,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # setup-uv publishes only full version tags, with no floating major tag.
       # Python 3.12 comes from .python-version.
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
 
