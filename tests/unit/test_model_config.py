@@ -75,6 +75,15 @@ def test_reads_config_file(tmp_path: Path) -> None:
     assert ModelConfig.from_file(path) == ModelConfig.from_dict(SMOLLM2_135M)
 
 
+def test_parses_config_written_by_transformers(
+    tiny_checkpoint: Path, tiny_config: ModelConfig
+) -> None:
+    path = tiny_checkpoint / "config.json"
+    # transformers 5 writes rope_parameters instead of rope_theta and rope_scaling.
+    assert "rope_parameters" in json.loads(path.read_text())
+    assert ModelConfig.from_file(path) == tiny_config
+
+
 def test_file_must_hold_an_object(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
     path.write_text("[1, 2]")
