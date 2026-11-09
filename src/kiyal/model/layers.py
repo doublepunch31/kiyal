@@ -102,8 +102,9 @@ def apply_rotary_embedding(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     """Rotates query or key heads by their positions.
 
     Uses the rotate-half layout of Hugging Face Llama checkpoints: dimension i is paired with
-    dimension i + D/2, not with its neighbor as in the original paper. The checkpoints' q and k
-    projections were permuted for this layout, so the interleaved form gives wrong outputs.
+    dimension i + D/2, not with its neighbor as in the original paper. Such checkpoints were
+    either trained in this layout or had their q and k projections permuted into it on
+    conversion, so the interleaved form gives wrong outputs on them.
 
     Args:
         x: [B, H, T, D] heads.
