@@ -5,9 +5,15 @@ from scratch in PyTorch.
 
 ## Status
 
-Early development. The project skeleton is in place: packaging, linting, type checking, tests, a
-`kiyal` command-line entry point, and automatic device and dtype selection (CUDA, MPS or CPU). The
-model, KV cache, batching and server are not implemented yet.
+Early development. Implemented so far:
+
+- automatic device and dtype selection (CUDA, MPS or CPU)
+- the Llama model: RMSNorm, rotary position embeddings, grouped-query attention and a SwiGLU MLP
+- a strict safetensors loader for Hugging Face checkpoints, from a local directory or the Hub
+
+On SmolLM2-135M-Instruct in fp32 on CPU, the model's logits match `transformers` within 1e-4 and
+greedy decoding picks the same token at each of 64 steps. Text generation, the KV cache, batching
+and the server are not implemented yet.
 
 ## Setup
 
@@ -32,6 +38,10 @@ uv run pyright                            # type-check
 uv run pytest -m "not slow"               # fast tests
 uv run pytest                             # all tests, including those that download weights
 ```
+
+The slow tests compare against `transformers` on SmolLM2-135M-Instruct and download its weights
+(about 270 MB) into the Hugging Face cache on first run. The fast tests use a tiny random model and
+download nothing.
 
 ## License
 
