@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 import torch
 from torch import Tensor
-from transformers import LlamaForCausalLM
+from transformers import LlamaForCausalLM, PreTrainedTokenizerBase
 
 from kiyal.model.llama import LlamaModel
 from kiyal.model.loader import load_model
@@ -33,12 +33,24 @@ TINY_VARIANTS: dict[str, dict[str, object]] = {
     },
 }
 
+# Plain text, or chat messages rendered with the model's chat template.
+SMOLLM2_PROMPTS: dict[str, str | list[dict[str, str]]] = {
+    "short": "The capital of France is",
+    "code": "def fibonacci(n):\n",
+    "paragraph": (
+        "A paged KV cache stores the keys and values of each sequence in fixed-size blocks "
+        "instead of one contiguous buffer. A block table maps each sequence's logical blocks "
+        "to physical blocks in a shared pool, so memory is allocated as sequences grow and "
+        "freed blocks can be reused by other requests. The main benefit is"
+    ),
+    "chat": [{"role": "user", "content": "What is the boiling point of water at sea level?"}],
+}
+SMOLLM2_GREEDY_STEPS = 64
 
-def load_reference(checkpoint: Path) -> LlamaForCausalLM:
-    # Eager attention computes softmax and masking explicitly, an independent path from the
-    # SDPA call under test.
+
+def load_reference(checkpoint: Path, attn_implementation: str) -> LlamaForCausalLM:
     return LlamaForCausalLM.from_pretrained(
-        checkpoint, dtype=torch.float32, attn_implementation="eager"
+        checkpoint, dtype=torch.float32, attn_implementation=attn_implementation
     ).eval()
 
 
@@ -79,7 +91,9 @@ def test_tiny_model_matches_transformers(
 ) -> None:
     checkpoint = make_tiny_checkpoint(**overrides)
     model = load_model(checkpoint, device=CPU, dtype=torch.float32)
-    reference = load_reference(checkpoint)
+    # Eager attention computes softmax and masking explicitly, independently of the SDPA call
+    # under test.
+    reference = load_reference(checkpoint, attn_implementation="eager")
 
     generator = torch.Generator().manual_seed(0)
     input_ids = torch.randint(0, model.config.vocab_size, (2, 40), generator=generator)
@@ -90,3 +104,44 @@ def test_tiny_model_matches_transformers(
     prompt = input_ids[:1, :8]
     ids = greedy_continuation(model, prompt, steps=32)
     assert_reference_picks_same_tokens(reference, ids, prompt_len=prompt.shape[1])
+
+
+def encode(tokenizer: PreTrainedTokenizerBase, prompt: str | list[dict[str, str]]) -> Tensor:
+    if isinstance(prompt, str):
+        return tokenizer(prompt, return_tensors="pt")["input_ids"]  # [1, T]
+    text = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
+    assert isinstance(text, str)
+    # The rendered template already contains its special tokens.
+    return tokenizer(text, add_special_tokens=False, return_tensors="pt")["input_ids"]
+
+
+@pytest.fixture(scope="module")
+def smollm2_model(smollm2_checkpoint: Path) -> LlamaModel:
+    return load_model(smollm2_checkpoint, device=CPU, dtype=torch.float32)
+
+
+@pytest.fixture(scope="module")
+def smollm2_reference(smollm2_checkpoint: Path) -> LlamaForCausalLM:
+    # SmolLM2's hidden states reach about 24,000, where fp32 values are spaced about 2e-3 apart.
+    # At that scale transformers' own eager and SDPA paths differ by up to 2e-4 in the logits,
+    # so the 1e-4 bound is checked against its default SDPA path. The tiny-model test above
+    # covers the eager comparison.
+    return load_reference(smollm2_checkpoint, attn_implementation="sdpa")
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("prompt", SMOLLM2_PROMPTS.values(), ids=list(SMOLLM2_PROMPTS))
+@torch.inference_mode()
+def test_smollm2_matches_transformers(
+    smollm2_model: LlamaModel,
+    smollm2_reference: LlamaForCausalLM,
+    smollm2_tokenizer: PreTrainedTokenizerBase,
+    prompt: str | list[dict[str, str]],
+) -> None:
+    prompt_ids = encode(smollm2_tokenizer, prompt)
+    ids = greedy_continuation(smollm2_model, prompt_ids, steps=SMOLLM2_GREEDY_STEPS)
+    # Logits are compared over the prompt and the generated tokens.
+    torch.testing.assert_close(
+        all_logits(smollm2_model, ids), smollm2_reference(ids).logits, atol=1e-4, rtol=0
+    )
+    assert_reference_picks_same_tokens(smollm2_reference, ids, prompt_len=prompt_ids.shape[1])

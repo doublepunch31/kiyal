@@ -25,6 +25,14 @@ jobs:
         with:
           enable-cache: true
 
+      # Reference tests download model weights. The key hashes the file that pins
+      # the model repos and revisions, so a new pin starts a fresh cache.
+      - name: Cache Hugging Face models
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/huggingface/hub
+          key: huggingface-${{ hashFiles('tests/reference/conftest.py') }}
+
       - name: Install dependencies
         run: uv sync --locked --extra cpu
 
@@ -39,3 +47,6 @@ jobs:
 
       - name: Test
         run: uv run pytest -m "not slow"
+
+      - name: Test against reference weights
+        run: uv run pytest -m slow
