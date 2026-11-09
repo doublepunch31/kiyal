@@ -7,7 +7,9 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "huggingface-hub>=2.4.0",
     "numpy>=2.5.4",
+    "safetensors>=0.8.0",
 ]
 
 # torch is installed through an extra so each machine picks its build:

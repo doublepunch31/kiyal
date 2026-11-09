@@ -192,7 +192,9 @@ name = "kiyal"
 version = "0.1.0.dev0"
 source = { editable = "." }
 dependencies = [
+    { name = "huggingface-hub" },
     { name = "numpy" },
+    { name = "safetensors" },
 ]
 
 [package.optional-dependencies]
@@ -211,7 +213,9 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "huggingface-hub", specifier = ">=2.4.0" },
     { name = "numpy", specifier = ">=2.5.4" },
+    { name = "safetensors", specifier = ">=0.8.0" },
     { name = "torch", marker = "extra == 'cpu'", specifier = ">=2.15,<3", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "kiyal", extra = "cpu" } },
 ]
 provides-extras = ["cpu"]
