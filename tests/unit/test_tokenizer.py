@@ -86,6 +86,8 @@ def test_missing_chat_template_raises(tiny_tokenizer_dir: Path, tmp_path: Path) 
     shutil.copytree(tiny_tokenizer_dir, model_dir)
     (model_dir / "chat_template.jinja").unlink()
     tokenizer = Tokenizer.from_dir(model_dir)
+    assert not tokenizer.has_chat_template
+    assert Tokenizer.from_dir(tiny_tokenizer_dir).has_chat_template
     with pytest.raises(TokenizerError, match="no chat template"):
         tokenizer.apply_chat_template(MESSAGES)
     with pytest.raises(TokenizerError, match="no chat template"):

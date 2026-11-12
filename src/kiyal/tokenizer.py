@@ -63,6 +63,10 @@ class Tokenizer:
     def eos_token_id(self) -> int | None:
         return self._backend.eos_token_id
 
+    @property
+    def has_chat_template(self) -> bool:
+        return self._backend.chat_template is not None
+
     def encode(self, text: str, *, add_special_tokens: bool = True) -> list[int]:
         """Tokenizes text.
 
@@ -93,7 +97,7 @@ class Tokenizer:
         Raises:
             TokenizerError: If the model has no chat template.
         """
-        if self._backend.chat_template is None:
+        if not self.has_chat_template:
             raise TokenizerError("the tokenizer has no chat template")
         return self._backend.apply_chat_template(
             [dict(message) for message in messages],
