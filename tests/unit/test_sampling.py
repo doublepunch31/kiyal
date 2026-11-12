@@ -5,7 +5,14 @@ import torch
 from torch import Tensor
 
 from kiyal.engine.sequence import SamplingParams
-from kiyal.sampling import SamplingTensors, sample, token_probs
+from kiyal.sampling import (
+    SamplingTensors,
+    apply_penalties,
+    draw_uniform,
+    sample,
+    token_counts,
+    token_probs,
+)
 
 CPU = torch.device("cpu")
 DRAWS = 20_000
@@ -260,3 +267,162 @@ def test_from_params_builds_one_entry_per_row() -> None:
     assert mixed.min_p.tolist() == [0.0, 0.0]
     assert not mixed.all_greedy
     assert batch(greedy, greedy).all_greedy
+
+
+def test_from_params_flags_batches_with_penalties() -> None:
+    plain = SamplingParams()
+    assert not batch(plain, plain).has_penalties
+    for penalized in (
+        SamplingParams(repetition_penalty=1.2),
+        SamplingParams(presence_penalty=0.5),
+        SamplingParams(frequency_penalty=-0.5),
+    ):
+        assert batch(plain, penalized).has_penalties
+    mixed = batch(plain, SamplingParams(repetition_penalty=1.2, frequency_penalty=0.5))
+    assert mixed.repetition_penalty.tolist() == pytest.approx([1.0, 1.2])
+    assert mixed.presence_penalty.tolist() == [0.0, 0.0]
+    assert mixed.frequency_penalty.tolist() == [0.0, 0.5]
+
+
+def test_token_counts_count_every_occurrence() -> None:
+    counts = token_counts([[1, 3, 1, 1], [], [0, 4]], vocab_size=5, device=CPU)
+    assert counts.tolist() == [[0, 3, 0, 1, 0], [0, 0, 0, 0, 0], [1, 0, 0, 0, 1]]
+    assert token_counts([], vocab_size=5, device=CPU).shape == (0, 5)
+
+
+def penalized(
+    logits: list[float], params: SamplingParams, prompt: list[int], output: list[int]
+) -> Tensor:
+    """Applies one row's penalties and returns its logits [V]."""
+    return apply_penalties(
+        torch.tensor([logits]),
+        batch(params),
+        token_counts([prompt], len(logits), CPU),
+        token_counts([output], len(logits), CPU),
+    )[0]
+
+
+def test_repetition_penalty_lowers_tokens_from_the_prompt_and_the_output() -> None:
+    # Token 0 is in the prompt, tokens 1 and 3 in the output, token 2 is new.
+    logits = penalized(
+        [2.0, 4.0, 3.0, -1.0], SamplingParams(repetition_penalty=2.0), prompt=[0], output=[1, 3, 3]
+    )
+    # Positive logits are halved. The negative one is doubled, which also lowers it, and
+    # occurring twice does not penalize it twice.
+    assert logits.tolist() == [1.0, 2.0, 3.0, -2.0]
+
+
+def test_presence_penalty_is_subtracted_once_per_generated_token() -> None:
+    logits = penalized(
+        [2.0, 4.0, 3.0, -1.0], SamplingParams(presence_penalty=0.5), prompt=[0], output=[1, 3, 3]
+    )
+    assert logits.tolist() == [2.0, 3.5, 3.0, -1.5]
+
+
+def test_frequency_penalty_grows_with_each_occurrence() -> None:
+    logits = penalized(
+        [2.0, 4.0, 3.0, -1.0], SamplingParams(frequency_penalty=0.5), prompt=[0], output=[1, 3, 3]
+    )
+    assert logits.tolist() == [2.0, 3.5, 3.0, -2.0]
+
+
+def test_negative_penalties_encourage_repetition() -> None:
+    params = SamplingParams(presence_penalty=-1.0, frequency_penalty=-0.5)
+    logits = penalized([2.0, 4.0, 3.0, -1.0], params, prompt=[], output=[1, 3, 3])
+    assert logits.tolist() == [2.0, 5.5, 3.0, 1.0]
+
+
+def test_default_penalties_leave_logits_unchanged() -> None:
+    logits = torch.randn(1, 30, generator=torch.Generator().manual_seed(8))
+    counts = token_counts([[1, 2, 2, 7]], 30, CPU)
+    assert torch.equal(apply_penalties(logits, batch(SamplingParams()), counts, counts), logits)
+
+
+def test_rows_keep_their_own_penalties() -> None:
+    logits = torch.tensor([[2.0, 4.0], [2.0, 4.0], [2.0, 4.0]])
+    params = batch(
+        SamplingParams(),
+        SamplingParams(repetition_penalty=2.0),
+        SamplingParams(frequency_penalty=1.0),
+    )
+    output_counts = token_counts([[1, 1], [1, 1], [1, 1]], 2, CPU)
+    result = apply_penalties(logits, params, torch.zeros(3, 2), output_counts)
+    assert result.tolist() == [[2.0, 4.0], [2.0, 2.0], [2.0, 2.0]]
+
+
+def test_penalties_take_effect_before_sampling() -> None:
+    # Token 0 leads until its two occurrences cost it 0.5 each.
+    logits = torch.tensor([[3.0, 2.5, 0.0]])
+    params = batch(SamplingParams(temperature=0, frequency_penalty=0.5))
+    counts = token_counts([[0, 0]], 3, CPU)
+    assert sample(logits, params, torch.rand(1)).tolist() == [0]
+    penalized_logits = apply_penalties(logits, params, torch.zeros(1, 3), counts)
+    assert sample(penalized_logits, params, torch.rand(1)).tolist() == [1]
+
+
+def test_half_precision_logits_are_penalized_in_fp32() -> None:
+    logits = torch.tensor([[2.0, 4.0, -1.0]], dtype=torch.bfloat16)
+    counts = token_counts([[0, 2]], 3, CPU)
+    result = apply_penalties(logits, batch(SamplingParams(repetition_penalty=1.5)), counts, counts)
+    assert result.dtype == torch.float32
+    torch.testing.assert_close(result, torch.tensor([[2.0 / 1.5, 4.0, -1.5]]))
+
+
+def seeded(seed: int) -> torch.Generator:
+    return torch.Generator().manual_seed(seed)
+
+
+def test_draws_lie_in_the_unit_interval() -> None:
+    uniform = draw_uniform([None] * 1000 + [seeded(0)] * 1000, shared=seeded(1))
+    assert uniform.shape == (2000,)
+    assert uniform.dtype == torch.float32
+    assert torch.all((uniform >= 0) & (uniform < 1))
+
+
+def test_seeded_rows_draw_the_same_numbers_in_any_batch() -> None:
+    # The same seed is used alone, then in the last row of a larger batch whose other rows
+    # draw from a different shared generator.
+    steps = 5
+    generator = seeded(42)
+    alone = torch.stack([draw_uniform([generator], shared=seeded(0))[0] for _ in range(steps)])
+    generator, shared = seeded(42), seeded(7)
+    in_batch = torch.stack(
+        [draw_uniform([None, seeded(step), None, generator], shared)[3] for step in range(steps)]
+    )
+    assert torch.equal(alone, in_batch)
+    assert len(set(alone.tolist())) == steps
+
+
+def test_rows_without_a_seed_draw_from_the_shared_generator() -> None:
+    first = draw_uniform([None, seeded(42), None], shared=seeded(0))
+    second = draw_uniform([None, seeded(42), None], shared=seeded(1))
+    assert first[1] == second[1]
+    assert first[0] != second[0]
+    assert first[2] != second[2]
+    assert first[0] != first[2]
+    assert torch.equal(first, draw_uniform([None, seeded(42), None], shared=seeded(0)))
+
+
+def test_different_seeds_draw_different_numbers() -> None:
+    uniform = draw_uniform([seeded(1), seeded(2), seeded(1)], shared=seeded(0))
+    assert uniform[0] != uniform[1]
+    assert uniform[0] == uniform[2]
+
+
+def test_a_seed_reproduces_the_sampled_tokens() -> None:
+    logits = torch.randn(6, 3, 100, generator=seeded(9))  # [steps, B, V]
+    params = batch(*[SamplingParams(temperature=1.2, top_p=0.95)] * 3)
+
+    def generate(seed: int, row: int, shared_seed: int) -> list[int]:
+        generators: list[torch.Generator | None] = [None, None, None]
+        generators[row] = seeded(seed)
+        shared = seeded(shared_seed)
+        # The same logits are placed in the seeded row at every step.
+        tokens = [
+            sample(step_logits[[0, 0, 0]], params, draw_uniform(generators, shared))[row]
+            for step_logits in logits
+        ]
+        return torch.stack(tokens).tolist()
+
+    assert generate(seed=5, row=0, shared_seed=1) == generate(seed=5, row=2, shared_seed=2)
+    assert generate(seed=5, row=0, shared_seed=1) != generate(seed=6, row=0, shared_seed=1)

@@ -19,8 +19,13 @@ class SamplingTensors:
     top_k: Tensor  # [B], 0 where the filter is off
     top_p: Tensor  # [B]
     min_p: Tensor  # [B]
-    # Known on the host, so the greedy fast path needs no read from the device.
+    repetition_penalty: Tensor  # [B]
+    presence_penalty: Tensor  # [B]
+    frequency_penalty: Tensor  # [B]
+    # Known on the host, so skipping the sort for a greedy batch, or the token counts for a
+    # batch without penalties, needs no read from the device.
     all_greedy: bool
+    has_penalties: bool
 
     @classmethod
     def from_params(cls, params: Sequence[SamplingParams], device: torch.device) -> Self:
@@ -29,8 +34,92 @@ class SamplingTensors:
             top_k=torch.tensor([p.top_k for p in params], device=device),
             top_p=torch.tensor([p.top_p for p in params], device=device),
             min_p=torch.tensor([p.min_p for p in params], device=device),
+            repetition_penalty=torch.tensor([p.repetition_penalty for p in params], device=device),
+            presence_penalty=torch.tensor([p.presence_penalty for p in params], device=device),
+            frequency_penalty=torch.tensor([p.frequency_penalty for p in params], device=device),
             all_greedy=all(p.temperature == 0 for p in params),
+            has_penalties=any(
+                p.repetition_penalty != 1 or p.presence_penalty != 0 or p.frequency_penalty != 0
+                for p in params
+            ),
         )
+
+
+def draw_uniform(generators: Sequence[torch.Generator | None], shared: torch.Generator) -> Tensor:
+    """Draws one number from [0, 1) for each row of a batch.
+
+    A row with its own generator draws from it, so a seeded request gets the same numbers
+    whichever other requests share its batch. The remaining rows draw from `shared`.
+
+    Generators stay on the CPU: a seed then gives the same draws on every device, and one
+    number per row is cheap to copy over.
+
+    Args:
+        generators: The generator of each row, or None for rows without a seed.
+        shared: CPU generator for the rows without their own.
+
+    Returns:
+        [B] draws, on the CPU.
+    """
+    uniform = torch.rand(len(generators), generator=shared)  # [B]
+    for row, generator in enumerate(generators):
+        if generator is not None:
+            uniform[row] = torch.rand((), generator=generator)
+    return uniform
+
+
+def token_counts(
+    token_ids: Sequence[Sequence[int]], vocab_size: int, device: torch.device
+) -> Tensor:
+    """Counts how often each token occurs in each row.
+
+    Args:
+        token_ids: The tokens of each row. Rows may differ in length.
+        vocab_size: Number of token ids, V.
+        device: Device of the result.
+
+    Returns:
+        [B, V] counts in fp32.
+    """
+    rows = [row for row, ids in enumerate(token_ids) for _ in ids]
+    columns = [token for ids in token_ids for token in ids]
+    counts = torch.zeros((len(token_ids), vocab_size), device=device)  # [B, V]
+    index = (
+        torch.tensor(rows, dtype=torch.long, device=device),
+        torch.tensor(columns, dtype=torch.long, device=device),
+    )
+    # accumulate adds 1 for every occurrence instead of writing 1 once per distinct token.
+    return counts.index_put_(index, torch.ones(len(columns), device=device), accumulate=True)
+
+
+def apply_penalties(
+    logits: Tensor, params: SamplingTensors, prompt_counts: Tensor, output_counts: Tensor
+) -> Tensor:
+    """Lowers the logits of tokens a row has already used.
+
+    The repetition penalty covers the prompt and the output. The presence and frequency
+    penalties count generated tokens only, as in the OpenAI API, so that a prompt does not
+    penalize the words needed to answer it.
+
+    Args:
+        logits: [B, V] next-token logits.
+        params: Settings of the B rows.
+        prompt_counts: [B, V] occurrences of each token in the row's prompt.
+        output_counts: [B, V] occurrences of each token in the row's output so far.
+
+    Returns:
+        [B, V] penalized logits in fp32.
+    """
+    logits = logits.float()  # [B, V]
+    # Repetition penalty from CTRL (Keskar et al., 2019). Dividing a negative logit would
+    # raise it, so negative logits are multiplied instead.
+    penalty = params.repetition_penalty.unsqueeze(-1)  # [B, 1]
+    seen = (prompt_counts + output_counts) > 0  # [B, V]
+    logits = torch.where(seen, torch.where(logits > 0, logits / penalty, logits * penalty), logits)
+
+    generated = output_counts > 0  # [B, V]
+    logits = logits - params.presence_penalty.unsqueeze(-1) * generated
+    return logits - params.frequency_penalty.unsqueeze(-1) * output_counts
 
 
 def sample(logits: Tensor, params: SamplingTensors, uniform: Tensor) -> Tensor:
