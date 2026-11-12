@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from transformers import PreTrainedTokenizerBase
 
-from kiyal.tokenizer import Tokenizer
+from kiyal.tokenizer import REPLACEMENT_CHARACTER, IncrementalDetokenizer, Tokenizer
 
 TEXTS = [
     "The capital of France is",
@@ -34,6 +34,15 @@ def test_smollm2_encoding_matches_transformers(
     ids = tokenizer.encode(text)
     assert ids == smollm2_tokenizer(text)["input_ids"]
     assert tokenizer.decode(ids) == text
+
+
+@pytest.mark.parametrize("text", TEXTS)
+def test_smollm2_stream_adds_up_to_the_text(tokenizer: Tokenizer, text: str) -> None:
+    detokenizer = IncrementalDetokenizer(tokenizer)
+    pieces = [detokenizer.add(token_id) for token_id in tokenizer.encode(text)]
+    assert "".join(pieces) == text
+    assert detokenizer.finish() == ""
+    assert not any(REPLACEMENT_CHARACTER in piece for piece in pieces)
 
 
 def test_smollm2_chat_prompt(tokenizer: Tokenizer) -> None:

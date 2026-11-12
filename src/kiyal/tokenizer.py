@@ -5,6 +5,11 @@ from typing import Final, Protocol, Self, cast
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 TOKENIZER_FILE: Final = "tokenizer.json"
+# What a decoder writes for bytes that are not a complete UTF-8 character.
+REPLACEMENT_CHARACTER: Final = "\ufffd"
+# Prompt tokens decoded along with the first output tokens. One visible token is enough
+# context; a few more make up for special tokens, which decode to nothing.
+PROMPT_CONTEXT_TOKENS: Final = 8
 
 
 class TokenizerError(Exception):
@@ -107,3 +112,53 @@ class Tokenizer:
         text = self.apply_chat_template(messages, add_generation_prompt=add_generation_prompt)
         # The template writes its own special tokens; adding them again would duplicate BOS.
         return self.encode(text, add_special_tokens=False)
+
+
+class IncrementalDetokenizer:
+    """Turns generated tokens into text one token at a time.
+
+    A token cannot be decoded on its own. The UTF-8 bytes of one character can be spread
+    over several tokens, and some tokenizers write a word's leading space only when the token
+    is not the first one decoded. So each token is decoded together with the tokens before
+    it, and only the text it adds is returned.
+    """
+
+    def __init__(self, tokenizer: Tokenizer, prompt_token_ids: Sequence[int] = ()) -> None:
+        """Starts a stream.
+
+        Args:
+            tokenizer: The tokenizer that produced the token ids.
+            prompt_token_ids: The prompt the output continues. Its last tokens are the
+                context for decoding the first output tokens; their text is not returned.
+        """
+        self._tokenizer = tokenizer
+        # Tokens whose text has already been returned, kept as context for the next decode.
+        self._context = list(prompt_token_ids[-PROMPT_CONTEXT_TOKENS:])
+        # Tokens whose text ends inside a character and is held back until it is complete.
+        self._pending: list[int] = []
+
+    def add(self, token_id: int) -> str:
+        """Adds a generated token and returns the text that became complete.
+
+        Returns an empty string while the output ends inside a character.
+        """
+        self._pending.append(token_id)
+        text = self._pending_text()
+        if text.endswith(REPLACEMENT_CHARACTER):
+            return ""
+        self._context, self._pending = self._pending, []
+        return text
+
+    def finish(self) -> str:
+        """Returns the text still held back, for when generation ends.
+
+        A character that never got its remaining bytes comes out as U+FFFD.
+        """
+        text = self._pending_text()
+        self._context, self._pending = self._context + self._pending, []
+        return text
+
+    def _pending_text(self) -> str:
+        context_text = self._tokenizer.decode(self._context)
+        text = self._tokenizer.decode(self._context + self._pending)
+        return text[len(context_text) :]
