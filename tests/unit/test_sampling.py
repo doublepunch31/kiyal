@@ -259,7 +259,10 @@ def test_half_precision_logits_are_sampled_in_fp32(dtype: torch.dtype) -> None:
 
 
 def test_from_params_builds_one_entry_per_row() -> None:
-    greedy, sampled = SamplingParams(temperature=0), SamplingParams(0.8, top_k=40, top_p=0.9)
+    greedy, sampled = (
+        SamplingParams(temperature=0),
+        SamplingParams(temperature=0.8, top_k=40, top_p=0.9),
+    )
     mixed = batch(greedy, sampled)
     assert mixed.temperature.tolist() == pytest.approx([0.0, 0.8])
     assert mixed.top_k.tolist() == [0, 40]

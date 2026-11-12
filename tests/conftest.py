@@ -1,4 +1,5 @@
 import json
+import shutil
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
@@ -133,3 +134,22 @@ def tiny_tokenizer_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
 @pytest.fixture(scope="session")
 def tiny_tokenizer(tiny_tokenizer_dir: Path) -> Tokenizer:
     return Tokenizer.from_dir(tiny_tokenizer_dir)
+
+
+@pytest.fixture(scope="session")
+def tiny_model_dir(
+    make_tiny_checkpoint: Callable[..., Path],
+    tiny_tokenizer_dir: Path,
+    tiny_tokenizer: Tokenizer,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Path:
+    """Directory holding a tiny random model and the tiny tokenizer it is sized for."""
+    checkpoint = make_tiny_checkpoint(
+        vocab_size=tiny_tokenizer.vocab_size,
+        bos_token_id=tiny_tokenizer.bos_token_id,
+        eos_token_id=tiny_tokenizer.eos_token_id,
+    )
+    model_dir = tmp_path_factory.mktemp("tiny-model")
+    shutil.copytree(checkpoint, model_dir, dirs_exist_ok=True)
+    shutil.copytree(tiny_tokenizer_dir, model_dir, dirs_exist_ok=True)
+    return model_dir

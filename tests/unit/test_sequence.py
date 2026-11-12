@@ -11,6 +11,7 @@ def test_defaults_sample_from_the_unfiltered_distribution() -> None:
     penalties = (params.repetition_penalty, params.presence_penalty, params.frequency_penalty)
     assert penalties == (1.0, 0.0, 0.0)
     assert params.seed is None
+    assert (params.stop, params.stop_token_ids, params.ignore_eos) == ((), (), False)
 
 
 @pytest.mark.parametrize(
@@ -26,6 +27,9 @@ def test_defaults_sample_from_the_unfiltered_distribution() -> None:
         {"frequency_penalty": 2.0},
         {"seed": 0},
         {"seed": 2**63 - 1},
+        {"max_tokens": 1},
+        {"stop": ("\n\n", "END")},
+        {"stop_token_ids": (0, 7)},
     ],
 )
 def test_values_at_the_edge_of_their_range_are_accepted(settings: dict[str, Any]) -> None:
@@ -51,6 +55,10 @@ def test_values_at_the_edge_of_their_range_are_accepted(settings: dict[str, Any]
         ({"frequency_penalty": -2.1}, "frequency_penalty"),
         ({"seed": -1}, "seed"),
         ({"seed": 2**63}, "seed"),
+        ({"max_tokens": 0}, "max_tokens"),
+        ({"stop": ("END", "")}, "stop"),
+        ({"stop": "END"}, "stop"),
+        ({"stop_token_ids": (3, -1)}, "stop_token_ids"),
     ],
 )
 def test_values_out_of_range_raise(settings: dict[str, Any], message: str) -> None:
