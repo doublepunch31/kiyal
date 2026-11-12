@@ -114,6 +114,66 @@ class Tokenizer:
         return self.encode(text, add_special_tokens=False)
 
 
+class StopStringMatcher:
+    """Finds stop strings in streamed text.
+
+    Text arrives in pieces, and a stop string can start in one piece and end in a later
+    one. Text that could still turn into a stop string is held back until the following
+    pieces decide it.
+    """
+
+    def __init__(self, stop: Sequence[str]) -> None:
+        """Starts a stream.
+
+        Raises:
+            ValueError: If a stop string is empty.
+        """
+        if any(not stop_string for stop_string in stop):
+            raise ValueError("stop strings must not be empty")
+        self._stop = tuple(stop)
+        self._held = ""
+        self._stopped = False
+
+    @property
+    def stopped(self) -> bool:
+        """Whether a stop string has been found. Text added after that is dropped."""
+        return self._stopped
+
+    def add(self, text: str) -> str:
+        """Adds a piece of text and returns the text that is safe to show.
+
+        The returned text ends before the first stop string and never holds part of one.
+        """
+        if self._stopped:
+            return ""
+        # A stop string that ends in this piece cannot start before the held text: its
+        # earlier characters would have been the start of a stop string and been held.
+        buffer = self._held + text
+        found = [index for index in map(buffer.find, self._stop) if index >= 0]
+        if found:
+            self._stopped = True
+            self._held = ""
+            return buffer[: min(found)]
+        safe_length = len(buffer) - self._possible_stop_length(buffer)
+        self._held = buffer[safe_length:]
+        return buffer[:safe_length]
+
+    def finish(self) -> str:
+        """Returns the text still held back, for when generation ends without a stop."""
+        held, self._held = self._held, ""
+        return held
+
+    def _possible_stop_length(self, text: str) -> int:
+        # Length of the longest ending of the text that is the beginning of a stop string.
+        longest = 0
+        for stop_string in self._stop:
+            for length in range(min(len(stop_string) - 1, len(text)), longest, -1):
+                if text.endswith(stop_string[:length]):
+                    longest = length
+                    break
+        return longest
+
+
 class IncrementalDetokenizer:
     """Turns generated tokens into text one token at a time.
 
@@ -123,31 +183,48 @@ class IncrementalDetokenizer:
     it, and only the text it adds is returned.
     """
 
-    def __init__(self, tokenizer: Tokenizer, prompt_token_ids: Sequence[int] = ()) -> None:
+    def __init__(
+        self,
+        tokenizer: Tokenizer,
+        prompt_token_ids: Sequence[int] = (),
+        stop: Sequence[str] = (),
+    ) -> None:
         """Starts a stream.
 
         Args:
             tokenizer: The tokenizer that produced the token ids.
             prompt_token_ids: The prompt the output continues. Its last tokens are the
                 context for decoding the first output tokens; their text is not returned.
+            stop: Strings that end the output. The output stops before the first one found
+                and does not include it.
+
+        Raises:
+            ValueError: If a stop string is empty.
         """
         self._tokenizer = tokenizer
+        self._stop = StopStringMatcher(stop)
         # Tokens whose text has already been returned, kept as context for the next decode.
         self._context = list(prompt_token_ids[-PROMPT_CONTEXT_TOKENS:])
         # Tokens whose text ends inside a character and is held back until it is complete.
         self._pending: list[int] = []
 
+    @property
+    def stopped(self) -> bool:
+        """Whether a stop string has been found. Tokens added after that give no text."""
+        return self._stop.stopped
+
     def add(self, token_id: int) -> str:
         """Adds a generated token and returns the text that became complete.
 
-        Returns an empty string while the output ends inside a character.
+        Returns an empty string while the output ends inside a character or in what could
+        be the start of a stop string.
         """
         self._pending.append(token_id)
         text = self._pending_text()
         if text.endswith(REPLACEMENT_CHARACTER):
             return ""
         self._context, self._pending = self._pending, []
-        return text
+        return self._stop.add(text)
 
     def finish(self) -> str:
         """Returns the text still held back, for when generation ends.
@@ -156,7 +233,7 @@ class IncrementalDetokenizer:
         """
         text = self._pending_text()
         self._context, self._pending = self._context + self._pending, []
-        return text
+        return self._stop.add(text) + self._stop.finish()
 
     def _pending_text(self) -> str:
         context_text = self._tokenizer.decode(self._context)
