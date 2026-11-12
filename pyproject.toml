@@ -46,9 +46,12 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "N", "PL"]
 # Assertions compare against literal expected values by design, and multilingual test text
 # contains letters that look like Latin ones.
 "tests/**" = ["PLR2004", "RUF001"]
+"benchmarks/**" = ["PLR2004"]
 
 [tool.pytest]
 testpaths = ["tests"]
+# The repository root, so that tests can import the benchmark scripts.
+pythonpath = ["."]
 strict = true
 # importlib mode lets test files in different directories share a name
 # without __init__.py files.
@@ -56,7 +59,7 @@ addopts = ["-ra", "--import-mode=importlib"]
 markers = ["slow: downloads real model weights; deselect with -m 'not slow'"]
 
 [tool.pyright]
-include = ["src", "tests"]
+include = ["src", "tests", "benchmarks"]
 pythonVersion = "3.12"
 typeCheckingMode = "basic"
 strict = ["src"]
