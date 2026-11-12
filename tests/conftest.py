@@ -4,9 +4,12 @@ from pathlib import Path
 
 import pytest
 import torch
-from transformers import LlamaConfig, LlamaForCausalLM
+from tokenizers import Tokenizer as BackendTokenizer
+from tokenizers import decoders, models, pre_tokenizers, processors, trainers
+from transformers import LlamaConfig, LlamaForCausalLM, PreTrainedTokenizerFast
 
 from kiyal.model.config import ModelConfig
+from kiyal.tokenizer import Tokenizer
 
 # A tiny Llama in Hugging Face config.json form: 2 layers, 4 query heads sharing 2 KV heads.
 TINY_CONFIG: dict[str, object] = {
@@ -26,6 +29,23 @@ TINY_CONFIG: dict[str, object] = {
     "bos_token_id": 1,
     "eos_token_id": 2,
 }
+
+TINY_BOS = "<|bos|>"
+TINY_EOS = "<|eos|>"
+TINY_CHAT_TEMPLATE = (
+    "{% for message in messages %}"
+    "<|bos|>{{ message['role'] }}\n{{ message['content'] }}<|eos|>\n"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}<|bos|>assistant\n{% endif %}"
+)
+# Text the tiny tokenizer learns its merges from. Repeated words become single tokens; every
+# other character falls back to one token per UTF-8 byte.
+TINY_TOKENIZER_CORPUS = [
+    "the cat sat on the mat and the dog sat on the log",
+    "мама мыла раму, а папа читал газету",
+    "кыял деген эмне, кыял деген түш",
+    "你好世界，你好朋友",
+]
 
 
 @pytest.fixture
@@ -77,3 +97,39 @@ def make_tiny_checkpoint(tmp_path_factory: pytest.TempPathFactory) -> Callable[.
 def tiny_checkpoint(make_tiny_checkpoint: Callable[..., Path]) -> Path:
     """Directory of a tiny random checkpoint written by transformers."""
     return make_tiny_checkpoint()
+
+
+def write_tiny_tokenizer(path: Path) -> Path:
+    # Byte-level BPE like GPT-2's: any text encodes without unknown tokens, and a character
+    # outside the learned merges takes one token per UTF-8 byte.
+    backend = BackendTokenizer(models.BPE())
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    trainer = trainers.BpeTrainer(
+        vocab_size=320,
+        special_tokens=[TINY_BOS, TINY_EOS],
+        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+        show_progress=False,
+    )
+    backend.train_from_iterator(TINY_TOKENIZER_CORPUS, trainer)
+    # Plain text gets a leading BOS, as Llama tokenizers add one.
+    backend.post_processor = processors.TemplateProcessing(
+        single=f"{TINY_BOS} $A", special_tokens=[(TINY_BOS, backend.token_to_id(TINY_BOS))]
+    )
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, bos_token=TINY_BOS, eos_token=TINY_EOS
+    )
+    tokenizer.chat_template = TINY_CHAT_TEMPLATE
+    tokenizer.save_pretrained(path)
+    return path
+
+
+@pytest.fixture(scope="session")
+def tiny_tokenizer_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Directory of a tiny byte-level BPE tokenizer with a chat template."""
+    return write_tiny_tokenizer(tmp_path_factory.mktemp("tiny-tokenizer"))
+
+
+@pytest.fixture(scope="session")
+def tiny_tokenizer(tiny_tokenizer_dir: Path) -> Tokenizer:
+    return Tokenizer.from_dir(tiny_tokenizer_dir)

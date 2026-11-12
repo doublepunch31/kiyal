@@ -193,3 +193,4 @@ def test_repo_id_downloads_from_the_hub(
     model = load_model("org/tiny-llama", device=CPU, dtype=torch.float32, revision="abc123")
     assert model.config.num_hidden_layers == 2
     assert calls == [("org/tiny-llama", "abc123", loader.HUB_FILE_PATTERNS)]
+    assert {"config.json", "model*.safetensors", "tokenizer.json"} <= set(calls[0][2])

@@ -10,6 +10,7 @@ dependencies = [
     "huggingface-hub>=2.4.0",
     "numpy>=2.5.4",
     "safetensors>=0.8.0",
+    "transformers>=5.22.2",
 ]
 
 # torch is installed through an extra so each machine picks its build:
@@ -42,8 +43,9 @@ target-version = "py312"
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "N", "PL"]
 
 [tool.ruff.lint.per-file-ignores]
-# Assertions compare against literal expected values by design.
-"tests/**" = ["PLR2004"]
+# Assertions compare against literal expected values by design, and multilingual test text
+# contains letters that look like Latin ones.
+"tests/**" = ["PLR2004", "RUF001"]
 
 [tool.pytest]
 testpaths = ["tests"]
@@ -66,5 +68,4 @@ dev = [
     "pyright>=1.1.414",
     "pytest>=9.2.0",
     "ruff>=0.17.3",
-    "transformers>=5.22.2",
 ]

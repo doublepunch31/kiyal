@@ -22,7 +22,16 @@ CONFIG_FILE: Final = "config.json"
 SINGLE_WEIGHTS_FILE: Final = "model.safetensors"
 WEIGHTS_INDEX_FILE: Final = "model.safetensors.index.json"
 # Top-level files only, so that copies of the weights in other formats or subfolders are skipped.
-HUB_FILE_PATTERNS: Final = [CONFIG_FILE, "model*.safetensors", WEIGHTS_INDEX_FILE]
+# The tokenizer files come along so that one download yields a complete model directory.
+HUB_FILE_PATTERNS: Final = [
+    CONFIG_FILE,
+    "model*.safetensors",
+    WEIGHTS_INDEX_FILE,
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "chat_template.jinja",
+]
 
 # Hugging Face tensor names and the parameters they fill.
 _MODEL_NAMES: Final = {
