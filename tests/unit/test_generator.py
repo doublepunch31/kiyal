@@ -21,9 +21,14 @@ def model(tiny_model_dir: Path) -> LlamaModel:
     return load_model(tiny_model_dir, device=CPU, dtype=torch.float32)
 
 
+@pytest.fixture(scope="module", params=[True, False], ids=["cached", "uncached"])
+def use_kv_cache(request: pytest.FixtureRequest) -> bool:
+    return request.param
+
+
 @pytest.fixture(scope="module")
-def generator(model: LlamaModel, tiny_tokenizer: Tokenizer) -> TextGenerator:
-    return TextGenerator(model, tiny_tokenizer)
+def generator(model: LlamaModel, tiny_tokenizer: Tokenizer, use_kv_cache: bool) -> TextGenerator:
+    return TextGenerator(model, tiny_tokenizer, use_kv_cache=use_kv_cache)
 
 
 @pytest.fixture(scope="module")
@@ -54,6 +59,32 @@ def test_greedy_generation_matches_an_argmax_loop(
         ids = torch.cat([ids, model(ids, positions).argmax(dim=-1, keepdim=True)], dim=1)
     steps = list(generator.generate(prompt, GREEDY))
     assert tokens_of(steps) == ids[0, len(prompt) :].tolist()
+
+
+def forward_lengths(model: LlamaModel, generator: TextGenerator, prompt: list[int]) -> list[int]:
+    """Number of tokens the model is run on at each step of a greedy generation."""
+    lengths: list[int] = []
+    hook = model.register_forward_pre_hook(lambda module, args: lengths.append(args[0].shape[1]))
+    list(generator.generate(prompt, GREEDY))
+    hook.remove()
+    return lengths
+
+
+def test_the_cache_is_used_by_default(model: LlamaModel, tiny_tokenizer: Tokenizer) -> None:
+    prompt = tiny_tokenizer.encode("the cat sat on")
+    lengths = forward_lengths(model, TextGenerator(model, tiny_tokenizer), prompt)
+    assert lengths == [len(prompt)] + [1] * (GREEDY.max_tokens - 1)
+
+
+def test_the_model_runs_on_the_tokens_that_are_not_cached(
+    generator: TextGenerator, model: LlamaModel, prompt: list[int], use_kv_cache: bool
+) -> None:
+    lengths = forward_lengths(model, generator, prompt)
+    if use_kv_cache:
+        # One prefill of the prompt, then one token per step.
+        assert lengths == [len(prompt)] + [1] * (GREEDY.max_tokens - 1)
+    else:
+        assert lengths == [len(prompt) + step for step in range(GREEDY.max_tokens)]
 
 
 def test_generation_ends_at_max_tokens(generator: TextGenerator, prompt: list[int]) -> None:

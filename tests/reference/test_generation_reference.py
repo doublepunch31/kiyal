@@ -6,6 +6,7 @@ from transformers import LlamaForCausalLM
 
 from kiyal.engine.generator import TextGenerator
 from kiyal.engine.sequence import FinishReason, SamplingParams
+from kiyal.model.llama import LlamaModel
 from kiyal.model.loader import load_model
 from kiyal.tokenizer import Tokenizer
 
@@ -22,9 +23,15 @@ def tokenizer(smollm2_checkpoint: Path) -> Tokenizer:
 
 
 @pytest.fixture(scope="module")
-def generator(smollm2_checkpoint: Path, tokenizer: Tokenizer) -> TextGenerator:
-    model = load_model(smollm2_checkpoint, device=CPU, dtype=torch.float32)
-    return TextGenerator(model, tokenizer)
+def model(smollm2_checkpoint: Path) -> LlamaModel:
+    return load_model(smollm2_checkpoint, device=CPU, dtype=torch.float32)
+
+
+@pytest.fixture(scope="module", params=[True, False], ids=["cached", "uncached"])
+def generator(
+    model: LlamaModel, tokenizer: Tokenizer, request: pytest.FixtureRequest
+) -> TextGenerator:
+    return TextGenerator(model, tokenizer, use_kv_cache=request.param)
 
 
 def test_smollm2_continues_a_sentence(generator: TextGenerator, tokenizer: Tokenizer) -> None:
