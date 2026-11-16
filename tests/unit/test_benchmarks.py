@@ -7,7 +7,7 @@ import torch
 
 from benchmarks import latency
 from benchmarks.common import REPO_ROOT, capture_environment, median, save_result
-from kiyal.engine.naive import NaiveGenerator
+from kiyal.engine.generator import TextGenerator
 from kiyal.model.loader import load_model
 from kiyal.tokenizer import Tokenizer
 
@@ -15,9 +15,9 @@ CPU = torch.device("cpu")
 
 
 @pytest.fixture(scope="module")
-def generator(tiny_model_dir: Path, tiny_tokenizer: Tokenizer) -> NaiveGenerator:
+def generator(tiny_model_dir: Path, tiny_tokenizer: Tokenizer) -> TextGenerator:
     model = load_model(tiny_model_dir, device=CPU, dtype=torch.float32)
-    return NaiveGenerator(model, tiny_tokenizer)
+    return TextGenerator(model, tiny_tokenizer)
 
 
 def test_environment_names_the_code_and_the_machine() -> None:
@@ -57,7 +57,7 @@ def test_run_timing_derives_the_per_token_metrics() -> None:
 
 
 def test_time_generation_times_the_requested_number_of_tokens(
-    generator: NaiveGenerator, tiny_tokenizer: Tokenizer
+    generator: TextGenerator, tiny_tokenizer: Tokenizer
 ) -> None:
     prompt = latency.build_prompt(tiny_tokenizer, 16)
     timing = latency.time_generation(generator, prompt, 8, CPU)
@@ -66,7 +66,7 @@ def test_time_generation_times_the_requested_number_of_tokens(
 
 
 def test_time_generation_rejects_lengths_it_cannot_measure(
-    generator: NaiveGenerator, tiny_tokenizer: Tokenizer
+    generator: TextGenerator, tiny_tokenizer: Tokenizer
 ) -> None:
     prompt = latency.build_prompt(tiny_tokenizer, 16)
     with pytest.raises(ValueError, match="at least 2 output tokens"):
@@ -77,7 +77,7 @@ def test_time_generation_rejects_lengths_it_cannot_measure(
 
 
 def test_measure_reports_every_run_and_the_medians(
-    generator: NaiveGenerator, tiny_tokenizer: Tokenizer
+    generator: TextGenerator, tiny_tokenizer: Tokenizer
 ) -> None:
     prompt = latency.build_prompt(tiny_tokenizer, 16)
     results = latency.measure(generator, prompt, [4, 8], CPU, repeats=3)

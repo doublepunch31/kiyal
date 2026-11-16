@@ -16,7 +16,7 @@ import torch
 
 from benchmarks.common import RAW_DIR, capture_environment, median, save_result, synchronize
 from kiyal.device import resolve_device, resolve_dtype
-from kiyal.engine.naive import NaiveGenerator
+from kiyal.engine.generator import TextGenerator
 from kiyal.engine.sequence import SamplingParams
 from kiyal.model.loader import load_model, resolve_model_dir
 from kiyal.tokenizer import Tokenizer
@@ -65,7 +65,7 @@ def build_prompt(tokenizer: Tokenizer, num_tokens: int) -> list[int]:
 
 
 def time_generation(
-    generator: NaiveGenerator, prompt: Sequence[int], output_tokens: int, device: torch.device
+    generator: TextGenerator, prompt: Sequence[int], output_tokens: int, device: torch.device
 ) -> RunTiming:
     """Generates exactly `output_tokens` tokens greedily and times the run.
 
@@ -98,7 +98,7 @@ def time_generation(
 
 
 def measure(
-    generator: NaiveGenerator,
+    generator: TextGenerator,
     prompt: Sequence[int],
     output_lengths: Sequence[int],
     device: torch.device,
@@ -144,7 +144,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     dtype = resolve_dtype(args.dtype, device)
     model_dir = resolve_model_dir(args.model, revision=args.revision)
     tokenizer = Tokenizer.from_dir(model_dir)
-    generator = NaiveGenerator(load_model(model_dir, device=device, dtype=dtype), tokenizer)
+    generator = TextGenerator(load_model(model_dir, device=device, dtype=dtype), tokenizer)
     prompt = build_prompt(tokenizer, args.prompt_tokens)
 
     # Untimed runs first: the first passes through a model pay for one-time setup such as

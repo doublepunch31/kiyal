@@ -4,7 +4,7 @@ import pytest
 import torch
 from transformers import LlamaForCausalLM
 
-from kiyal.engine.naive import NaiveGenerator
+from kiyal.engine.generator import TextGenerator
 from kiyal.engine.sequence import FinishReason, SamplingParams
 from kiyal.model.loader import load_model
 from kiyal.tokenizer import Tokenizer
@@ -22,12 +22,12 @@ def tokenizer(smollm2_checkpoint: Path) -> Tokenizer:
 
 
 @pytest.fixture(scope="module")
-def generator(smollm2_checkpoint: Path, tokenizer: Tokenizer) -> NaiveGenerator:
+def generator(smollm2_checkpoint: Path, tokenizer: Tokenizer) -> TextGenerator:
     model = load_model(smollm2_checkpoint, device=CPU, dtype=torch.float32)
-    return NaiveGenerator(model, tokenizer)
+    return TextGenerator(model, tokenizer)
 
 
-def test_smollm2_continues_a_sentence(generator: NaiveGenerator, tokenizer: Tokenizer) -> None:
+def test_smollm2_continues_a_sentence(generator: TextGenerator, tokenizer: Tokenizer) -> None:
     params = SamplingParams(max_tokens=16, temperature=0)
     steps = list(generator.generate(tokenizer.encode("The capital of France is"), params))
     assert len(steps) == 16
@@ -36,7 +36,7 @@ def test_smollm2_continues_a_sentence(generator: NaiveGenerator, tokenizer: Toke
 
 
 def test_smollm2_ends_a_chat_reply_at_the_end_of_turn_token(
-    generator: NaiveGenerator, tokenizer: Tokenizer
+    generator: TextGenerator, tokenizer: Tokenizer
 ) -> None:
     params = SamplingParams(max_tokens=64, temperature=0)
     steps = list(generator.generate(tokenizer.encode_chat(QUESTION), params))
@@ -48,7 +48,7 @@ def test_smollm2_ends_a_chat_reply_at_the_end_of_turn_token(
 
 @torch.inference_mode()
 def test_smollm2_greedy_output_matches_transformers_generate(
-    generator: NaiveGenerator, tokenizer: Tokenizer, smollm2_checkpoint: Path
+    generator: TextGenerator, tokenizer: Tokenizer, smollm2_checkpoint: Path
 ) -> None:
     prompt = tokenizer.encode_chat(QUESTION)
     reference = LlamaForCausalLM.from_pretrained(smollm2_checkpoint, dtype=torch.float32).eval()

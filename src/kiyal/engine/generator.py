@@ -25,7 +25,7 @@ class GenerationStep:
     finish_reason: FinishReason | None
 
 
-class NaiveGenerator:
+class TextGenerator:
     """Generates text for one request by running the model on the whole sequence each step.
 
     Step n recomputes all n tokens so far, so generating n tokens costs on the order of n^2

@@ -6,7 +6,7 @@ import torch
 
 from kiyal import __version__
 from kiyal.cli import main
-from kiyal.engine.naive import NaiveGenerator
+from kiyal.engine.generator import TextGenerator
 from kiyal.engine.sequence import SamplingParams
 from kiyal.model.loader import load_model
 from kiyal.tokenizer import Tokenizer
@@ -45,7 +45,7 @@ def run_generate(model_dir: Path, *args: str) -> list[str]:
 def expected_text(model_dir: Path, prompt_token_ids: list[int], params: SamplingParams) -> str:
     """What the engine generates for a prompt, bypassing the command line."""
     model = load_model(model_dir, device=torch.device("cpu"), dtype=torch.float32)
-    generator = NaiveGenerator(model, Tokenizer.from_dir(model_dir))
+    generator = TextGenerator(model, Tokenizer.from_dir(model_dir))
     return "".join(step.text for step in generator.generate(prompt_token_ids, params))
 
 

@@ -5,7 +5,7 @@ from collections.abc import Sequence
 
 from kiyal import __version__
 from kiyal.device import DeviceUnavailableError, resolve_device, resolve_dtype
-from kiyal.engine.naive import NaiveGenerator
+from kiyal.engine.generator import TextGenerator
 from kiyal.engine.sequence import SamplingParams
 from kiyal.model.loader import CheckpointError, load_model, resolve_model_dir
 from kiyal.tokenizer import Tokenizer, TokenizerError
@@ -103,7 +103,7 @@ def _run_generate(args: argparse.Namespace) -> int:
     tokenizer = Tokenizer.from_dir(model_dir)
     model = load_model(model_dir, device=device, dtype=dtype)
     prompt_token_ids = _encode_prompt(tokenizer, args.prompt, system=args.system, raw=args.raw)
-    generator = NaiveGenerator(model, tokenizer)
+    generator = TextGenerator(model, tokenizer)
 
     num_tokens = 0
     finish_reason = None

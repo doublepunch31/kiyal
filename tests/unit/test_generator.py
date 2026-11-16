@@ -5,7 +5,7 @@ import pytest
 import torch
 from transformers import AutoTokenizer
 
-from kiyal.engine.naive import GenerationStep, NaiveGenerator
+from kiyal.engine.generator import GenerationStep, TextGenerator
 from kiyal.engine.sequence import FinishReason, SamplingParams
 from kiyal.model.llama import LlamaModel
 from kiyal.model.loader import load_model
@@ -22,8 +22,8 @@ def model(tiny_model_dir: Path) -> LlamaModel:
 
 
 @pytest.fixture(scope="module")
-def generator(model: LlamaModel, tiny_tokenizer: Tokenizer) -> NaiveGenerator:
-    return NaiveGenerator(model, tiny_tokenizer)
+def generator(model: LlamaModel, tiny_tokenizer: Tokenizer) -> TextGenerator:
+    return TextGenerator(model, tiny_tokenizer)
 
 
 @pytest.fixture(scope="module")
@@ -46,7 +46,7 @@ def first_new_token_step(token_ids: list[int]) -> int:
 
 @torch.inference_mode()
 def test_greedy_generation_matches_an_argmax_loop(
-    generator: NaiveGenerator, model: LlamaModel, prompt: list[int]
+    generator: TextGenerator, model: LlamaModel, prompt: list[int]
 ) -> None:
     ids = torch.tensor([prompt])  # [1, T]
     for _ in range(GREEDY.max_tokens):
@@ -56,7 +56,7 @@ def test_greedy_generation_matches_an_argmax_loop(
     assert tokens_of(steps) == ids[0, len(prompt) :].tolist()
 
 
-def test_generation_ends_at_max_tokens(generator: NaiveGenerator, prompt: list[int]) -> None:
+def test_generation_ends_at_max_tokens(generator: TextGenerator, prompt: list[int]) -> None:
     steps = list(generator.generate(prompt, GREEDY))
     assert len(steps) == GREEDY.max_tokens
     assert [step.finish_reason for step in steps[:-1]] == [None] * (GREEDY.max_tokens - 1)
@@ -65,14 +65,14 @@ def test_generation_ends_at_max_tokens(generator: NaiveGenerator, prompt: list[i
 
 @pytest.mark.parametrize("params", [GREEDY, SamplingParams(max_tokens=40, seed=3, ignore_eos=True)])
 def test_step_texts_add_up_to_the_decoded_output(
-    generator: NaiveGenerator, tiny_tokenizer: Tokenizer, prompt: list[int], params: SamplingParams
+    generator: TextGenerator, tiny_tokenizer: Tokenizer, prompt: list[int], params: SamplingParams
 ) -> None:
     steps = list(generator.generate(prompt, params))
     assert text_of(steps) == tiny_tokenizer.decode(tokens_of(steps))
 
 
 def test_a_stop_token_ends_generation_without_adding_text(
-    generator: NaiveGenerator, tiny_tokenizer: Tokenizer, prompt: list[int]
+    generator: TextGenerator, tiny_tokenizer: Tokenizer, prompt: list[int]
 ) -> None:
     baseline = tokens_of(list(generator.generate(prompt, GREEDY)))
     stop_step = first_new_token_step(baseline)
@@ -88,10 +88,10 @@ def test_an_eos_token_ends_generation_unless_ignored(
 ) -> None:
     # A separate model instance, so that changing its config does not affect other tests.
     model = load_model(tiny_model_dir, device=CPU, dtype=torch.float32)
-    baseline = tokens_of(list(NaiveGenerator(model, tiny_tokenizer).generate(prompt, GREEDY)))
+    baseline = tokens_of(list(TextGenerator(model, tiny_tokenizer).generate(prompt, GREEDY)))
     stop_step = first_new_token_step(baseline)
     model.config = dataclasses.replace(model.config, eos_token_id=(baseline[stop_step],))
-    generator = NaiveGenerator(model, tiny_tokenizer)
+    generator = TextGenerator(model, tiny_tokenizer)
 
     steps = list(generator.generate(prompt, dataclasses.replace(GREEDY, ignore_eos=False)))
     assert tokens_of(steps) == baseline[: stop_step + 1]
@@ -103,7 +103,7 @@ def test_the_tokenizer_eos_token_ends_generation(
     tiny_model_dir: Path, tiny_tokenizer: Tokenizer, prompt: list[int]
 ) -> None:
     model = load_model(tiny_model_dir, device=CPU, dtype=torch.float32)
-    baseline = tokens_of(list(NaiveGenerator(model, tiny_tokenizer).generate(prompt, GREEDY)))
+    baseline = tokens_of(list(TextGenerator(model, tiny_tokenizer).generate(prompt, GREEDY)))
     stop_step = first_new_token_step(baseline)
     # config.json names no EOS token here; only the tokenizer does.
     model.config = dataclasses.replace(model.config, eos_token_id=())
@@ -113,13 +113,13 @@ def test_the_tokenizer_eos_token_ends_generation(
     assert tokenizer.eos_token_id == baseline[stop_step]
 
     params = dataclasses.replace(GREEDY, ignore_eos=False)
-    steps = list(NaiveGenerator(model, tokenizer).generate(prompt, params))
+    steps = list(TextGenerator(model, tokenizer).generate(prompt, params))
     assert tokens_of(steps) == baseline[: stop_step + 1]
     assert steps[-1].finish_reason is FinishReason.STOP
 
 
 def test_a_stop_string_ends_generation_before_it(
-    generator: NaiveGenerator, prompt: list[int]
+    generator: TextGenerator, prompt: list[int]
 ) -> None:
     params = SamplingParams(max_tokens=40, seed=3, ignore_eos=True)
     baseline = text_of(list(generator.generate(prompt, params)))
@@ -131,7 +131,7 @@ def test_a_stop_string_ends_generation_before_it(
     assert len(steps) < params.max_tokens
 
 
-def test_a_seed_reproduces_the_output(generator: NaiveGenerator, prompt: list[int]) -> None:
+def test_a_seed_reproduces_the_output(generator: TextGenerator, prompt: list[int]) -> None:
     def run(seed: int | None) -> list[int]:
         params = SamplingParams(max_tokens=24, seed=seed, ignore_eos=True)
         return tokens_of(list(generator.generate(prompt, params)))
@@ -145,8 +145,8 @@ def test_generators_without_a_seed_start_from_different_states(
     model: LlamaModel, tiny_tokenizer: Tokenizer, prompt: list[int]
 ) -> None:
     params = SamplingParams(max_tokens=24, ignore_eos=True)
-    first = list(NaiveGenerator(model, tiny_tokenizer).generate(prompt, params))
-    second = list(NaiveGenerator(model, tiny_tokenizer).generate(prompt, params))
+    first = list(TextGenerator(model, tiny_tokenizer).generate(prompt, params))
+    second = list(TextGenerator(model, tiny_tokenizer).generate(prompt, params))
     assert tokens_of(first) != tokens_of(second)
 
 
@@ -176,7 +176,7 @@ def penalized_argmax_loop(
 
 
 def test_penalties_count_prompt_and_output_tokens_separately(
-    generator: NaiveGenerator, model: LlamaModel, prompt: list[int]
+    generator: TextGenerator, model: LlamaModel, prompt: list[int]
 ) -> None:
     # The prompt ends with the start of the model's own greedy continuation, so it holds the
     # tokens the model would pick next and penalties on prompt tokens change the output.
@@ -192,7 +192,7 @@ def test_penalties_count_prompt_and_output_tokens_separately(
 
 
 def test_generation_ends_when_the_context_is_full(
-    generator: NaiveGenerator, model: LlamaModel, prompt: list[int]
+    generator: TextGenerator, model: LlamaModel, prompt: list[int]
 ) -> None:
     max_positions = model.config.max_position_embeddings
     long_prompt = (prompt * max_positions)[: max_positions - 3]
@@ -202,14 +202,14 @@ def test_generation_ends_when_the_context_is_full(
 
 
 def test_a_prompt_that_fills_the_context_raises(
-    generator: NaiveGenerator, model: LlamaModel, prompt: list[int]
+    generator: TextGenerator, model: LlamaModel, prompt: list[int]
 ) -> None:
     max_positions = model.config.max_position_embeddings
     with pytest.raises(ValueError, match="at least one output token"):
         next(generator.generate((prompt * max_positions)[:max_positions], GREEDY))
 
 
-def test_an_empty_prompt_raises(generator: NaiveGenerator) -> None:
+def test_an_empty_prompt_raises(generator: TextGenerator) -> None:
     with pytest.raises(ValueError, match="no tokens"):
         next(generator.generate([], GREEDY))
 
@@ -219,11 +219,11 @@ def test_a_tokenizer_larger_than_the_model_raises(
 ) -> None:
     small_model = load_model(tiny_checkpoint, device=CPU, dtype=torch.float32)
     with pytest.raises(ValueError, match="the model only has 256"):
-        NaiveGenerator(small_model, tiny_tokenizer)
+        TextGenerator(small_model, tiny_tokenizer)
 
 
 def test_each_step_runs_in_inference_mode_without_leaking_it(
-    generator: NaiveGenerator, model: LlamaModel, prompt: list[int]
+    generator: TextGenerator, model: LlamaModel, prompt: list[int]
 ) -> None:
     in_forward: list[bool] = []
     hook = model.register_forward_pre_hook(
