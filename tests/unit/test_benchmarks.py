@@ -8,6 +8,7 @@ import torch
 from benchmarks import latency
 from benchmarks.common import REPO_ROOT, capture_environment, median, save_result
 from kiyal.engine.generator import TextGenerator
+from kiyal.model.llama import LlamaModel
 from kiyal.model.loader import load_model
 from kiyal.tokenizer import Tokenizer
 
@@ -91,16 +92,17 @@ def test_measure_reports_every_run_and_the_medians(
         assert set(summary) == {"total_s", "ttft_s", "tpot_s", "output_tokens_per_s"}
 
 
+@pytest.mark.parametrize("engine", latency.ENGINES)
 def test_main_saves_a_result_file(
-    tiny_model_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tiny_model_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str], engine: str
 ) -> None:
     output = tmp_path / "latency.json"
     options = ["--device", "cpu", "--dtype", "fp32", "--prompt-tokens", "16", "--repeats", "2"]
-    args = ["--model", str(tiny_model_dir), *options, "--output-tokens", "4", "8"]
-    assert latency.main([*args, "--output", str(output)]) == 0
+    args = ["--model", str(tiny_model_dir), "--engine", engine, *options]
+    assert latency.main([*args, "--output-tokens", "4", "8", "--output", str(output)]) == 0
 
     result = json.loads(output.read_text())
-    assert (result["benchmark"], result["engine"]) == ("latency", "naive")
+    assert (result["benchmark"], result["engine"]) == ("latency", engine)
     assert (result["prompt_tokens"], result["repeats"], result["warmup"]) == (16, 2, 1)
     assert result["environment"]["device"] == "cpu"
     assert [entry["output_tokens"] for entry in result["results"]] == [4, 8]
@@ -108,3 +110,44 @@ def test_main_saves_a_result_file(
     printed = capsys.readouterr().out
     assert "tokens/s" in printed
     assert f"saved {output}" in printed
+
+
+@pytest.mark.parametrize(
+    ("engine", "prefill_and_first_step"), [("cached", [16, 1]), ("naive", [16, 17])]
+)
+def test_main_runs_the_requested_engine(
+    tiny_model_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    engine: str,
+    prefill_and_first_step: list[int],
+) -> None:
+    lengths: list[int] = []
+    forward = LlamaModel.forward
+
+    def recording_forward(self: LlamaModel, input_ids: torch.Tensor, *args, **kwargs):
+        lengths.append(input_ids.shape[1])
+        return forward(self, input_ids, *args, **kwargs)
+
+    monkeypatch.setattr(LlamaModel, "forward", recording_forward)
+    options = ["--device", "cpu", "--dtype", "fp32", "--prompt-tokens", "16", "--repeats", "1"]
+    args = ["--model", str(tiny_model_dir), "--engine", engine, *options]
+    assert latency.main([*args, "--output-tokens", "4", "--output", str(tmp_path / "x.json")]) == 0
+    assert lengths[:2] == prefill_and_first_step
+
+
+def test_the_default_run_covers_32_to_2048_output_tokens_with_the_cache(
+    tiny_model_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requested: list[list[int]] = []
+
+    def fake_measure(generator, prompt, output_lengths, device, repeats):
+        requested.append(list(output_lengths))
+        return []
+
+    monkeypatch.setattr(latency, "measure", fake_measure)
+    output = tmp_path / "latency.json"
+    args = ["--model", str(tiny_model_dir), "--device", "cpu", "--warmup", "0"]
+    assert latency.main([*args, "--output", str(output)]) == 0
+    assert requested == [[32, 64, 128, 256, 512, 1024, 2048]]
+    assert json.loads(output.read_text())["engine"] == "cached"

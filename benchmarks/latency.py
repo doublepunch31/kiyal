@@ -1,8 +1,9 @@
-"""Single-request latency: decoding speed at several output lengths.
+"""Single-request latency: decoding speed at several output lengths, with or without the KV cache.
 
-Run from the repository root:
+Run from the repository root, once per engine:
 
-    uv run python -m benchmarks.latency --model HuggingFaceTB/SmolLM2-135M-Instruct
+    uv run python -m benchmarks.latency --model HuggingFaceTB/SmolLM2-135M-Instruct --engine cached
+    uv run python -m benchmarks.latency --model HuggingFaceTB/SmolLM2-135M-Instruct --engine naive
 """
 
 import argparse
@@ -20,6 +21,10 @@ from kiyal.engine.generator import TextGenerator
 from kiyal.engine.sequence import SamplingParams
 from kiyal.model.loader import load_model, resolve_model_dir
 from kiyal.tokenizer import Tokenizer
+
+# "naive" runs the model on the whole sequence at every step; "cached" reuses keys and values.
+ENGINES = ("cached", "naive")
+DEFAULT_OUTPUT_TOKENS = (32, 64, 128, 256, 512, 1024, 2048)
 
 # Repeated and cut to the requested number of tokens. Ordinary prose keeps the measured work
 # close to a real request; the output itself does not matter because decoding is greedy with
@@ -131,10 +136,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Measures single-request decoding speed.")
     parser.add_argument("--model", required=True, help="checkpoint directory or Hub repo id")
     parser.add_argument("--revision", help="branch, tag or commit of a Hub repo")
+    parser.add_argument("--engine", choices=ENGINES, default="cached")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--prompt-tokens", type=int, default=128)
-    parser.add_argument("--output-tokens", type=int, nargs="+", default=[32, 64, 128, 256])
+    parser.add_argument("--output-tokens", type=int, nargs="+", default=DEFAULT_OUTPUT_TOKENS)
     parser.add_argument("--repeats", type=int, default=3, help="timed runs per output length")
     parser.add_argument("--warmup", type=int, default=1, help="untimed runs before measuring")
     parser.add_argument("--output", type=Path, help="result file (default: benchmarks/raw/)")
@@ -144,7 +150,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     dtype = resolve_dtype(args.dtype, device)
     model_dir = resolve_model_dir(args.model, revision=args.revision)
     tokenizer = Tokenizer.from_dir(model_dir)
-    generator = TextGenerator(load_model(model_dir, device=device, dtype=dtype), tokenizer)
+    model = load_model(model_dir, device=device, dtype=dtype)
+    generator = TextGenerator(model, tokenizer, use_kv_cache=args.engine == "cached")
     prompt = build_prompt(tokenizer, args.prompt_tokens)
 
     # Untimed runs first: the first passes through a model pay for one-time setup such as
@@ -154,7 +161,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     results = measure(generator, prompt, args.output_tokens, device, args.repeats)
     result: dict[str, object] = {
         "benchmark": "latency",
-        "engine": "naive",
+        "engine": args.engine,
         "model": args.model,
         "revision": args.revision,
         "prompt_tokens": len(prompt),
@@ -164,7 +171,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "results": results,
     }
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    path = save_result(result, args.output or RAW_DIR / f"latency-naive-{timestamp}.json")
+    name = f"latency-{args.engine}-{device.type}-{timestamp}.json"
+    path = save_result(result, args.output or RAW_DIR / name)
 
     print(f"{'output tokens':>13}  {'tokens/s':>8}  {'TTFT ms':>8}  {'TPOT ms':>8}")
     for entry in results:
