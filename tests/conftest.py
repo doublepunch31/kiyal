@@ -10,7 +10,9 @@ from tokenizers import decoders, models, pre_tokenizers, processors, trainers
 from transformers import LlamaConfig, LlamaForCausalLM, PreTrainedTokenizerFast
 
 from kiyal.model.config import ModelConfig
+from kiyal.model.loader import resolve_model_dir
 from kiyal.tokenizer import Tokenizer
+from tests.pinned_models import SMOLLM2_REPO, SMOLLM2_REVISION
 
 # A tiny Llama in Hugging Face config.json form: 2 layers, 4 query heads sharing 2 KV heads.
 TINY_CONFIG: dict[str, object] = {
@@ -52,6 +54,12 @@ TINY_TOKENIZER_CORPUS = [
 @pytest.fixture
 def tiny_config() -> ModelConfig:
     return ModelConfig.from_dict(TINY_CONFIG)
+
+
+@pytest.fixture(scope="session")
+def smollm2_checkpoint() -> Path:
+    """Directory of the real SmolLM2-135M weights and tokenizer, downloaded on first use."""
+    return resolve_model_dir(SMOLLM2_REPO, revision=SMOLLM2_REVISION)
 
 
 def write_tiny_checkpoint(
