@@ -1,6 +1,7 @@
 import torch
 from torch import Tensor, nn
 
+from kiyal.cache.contiguous import ContiguousKVCache
 from kiyal.model.attention import Attention
 from kiyal.model.config import ModelConfig
 from kiyal.model.layers import MLP, RMSNorm, RotaryEmbedding
@@ -23,8 +24,15 @@ class DecoderLayer(nn.Module):
         self.mlp_norm = RMSNorm(hidden, eps, device=device, dtype=dtype)
         self.mlp = MLP(hidden, config.intermediate_size, device=device, dtype=dtype)
 
-    def forward(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-        x = x + self.attn(self.attn_norm(x), cos, sin)  # [B, T, hidden]
+    def forward(
+        self,
+        x: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+        cache: ContiguousKVCache | None = None,
+        layer_index: int = 0,
+    ) -> Tensor:
+        x = x + self.attn(self.attn_norm(x), cos, sin, cache, layer_index)  # [B, T, hidden]
         return x + self.mlp(self.mlp_norm(x))  # [B, T, hidden]
 
 
@@ -65,7 +73,11 @@ class LlamaModel(nn.Module):
             self.lm_head.weight = self.embed_tokens.weight
 
     def forward(
-        self, input_ids: Tensor, positions: Tensor, logits_indices: Tensor | None = None
+        self,
+        input_ids: Tensor,
+        positions: Tensor,
+        logits_indices: Tensor | None = None,
+        cache: ContiguousKVCache | None = None,
     ) -> Tensor:
         """Computes next-token logits for selected tokens.
 
@@ -73,11 +85,17 @@ class LlamaModel(nn.Module):
         would allocate [B*T, V], which for a long prompt and a large vocabulary is hundreds of
         megabytes, and spend LM-head FLOPs on rows nobody reads.
 
+        Without a cache, `input_ids` holds whole sequences. With one, it holds only the
+        tokens that follow the cached ones: the whole prompt while the cache is empty
+        (prefill), then one new token per step (decode). The new tokens are added to the
+        cache.
+
         Args:
             input_ids: [B, T] token ids.
             positions: [B, T] position of each token in its sequence.
             logits_indices: [K] indices into the flattened B*T tokens (row b, column t is
                 b * T + t). Defaults to the last token of each row.
+            cache: Keys and values of the tokens before `input_ids`.
 
         Returns:
             [K, V] logits, or [B, V] when logits_indices is None.
@@ -85,8 +103,10 @@ class LlamaModel(nn.Module):
         batch_size, seq_len = input_ids.shape
         hidden = self.embed_tokens(input_ids)  # [B, T, hidden]
         cos, sin = self.rotary(positions, hidden.dtype)  # [B, T, D/2] each
-        for layer in self.layers:
-            hidden = layer(hidden, cos, sin)  # [B, T, hidden]
+        for layer_index, layer in enumerate(self.layers):
+            hidden = layer(hidden, cos, sin, cache, layer_index)  # [B, T, hidden]
+        if cache is not None:
+            cache.advance(seq_len)
 
         if logits_indices is None:
             selected = hidden[:, -1]  # [B, hidden]

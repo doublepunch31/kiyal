@@ -2,6 +2,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn.functional import scaled_dot_product_attention
 
+from kiyal.cache.contiguous import ContiguousKVCache
 from kiyal.model.config import ModelConfig
 from kiyal.model.layers import apply_rotary_embedding
 
@@ -34,13 +35,25 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(hidden, kv_size, bias=bias, device=device, dtype=dtype)
         self.o_proj = nn.Linear(q_size, hidden, bias=bias, device=device, dtype=dtype)
 
-    def forward(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+        cache: ContiguousKVCache | None = None,
+        layer_index: int = 0,
+    ) -> Tensor:
         """Attends each token to itself and the tokens before it.
+
+        With a cache, `x` holds only the tokens that are not cached yet. Their keys and
+        values are stored, and their queries attend to the cached tokens as well.
 
         Args:
             x: [B, T, hidden] normalized hidden states.
             cos: [B, T, D/2] rotary table rows for the tokens' positions.
             sin: [B, T, D/2] rotary table rows for the tokens' positions.
+            cache: Keys and values of the tokens before `x`, extended with those of `x`.
+            layer_index: This layer's index in the cache.
 
         Returns:
             [B, T, hidden] attention output after the output projection.
@@ -59,6 +72,29 @@ class Attention(nn.Module):
 
         # The default scale is 1/sqrt(D). enable_gqa maps query head h to KV head
         # h // (H / Hkv) inside SDPA, so K and V are never expanded here.
-        out = scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)  # [B, H, T, D]
+        if cache is None:
+            out = scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+        else:
+            # Keys are cached after rotation: a key's rotation depends only on its own
+            # position, so it never has to be redone.
+            k, v = cache.write(layer_index, k, v)  # [B, Hkv, T_all, D]
+            mask = _causal_mask(seq_len, k.shape[2], x.device)
+            out = scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=True)
+        # out: [B, H, T, D]
         out = out.transpose(1, 2).reshape(batch_size, seq_len, -1)  # [B, T, H*D]
         return self.o_proj(out)  # [B, T, hidden]
+
+
+def _causal_mask(num_new: int, num_all: int, device: torch.device) -> Tensor | None:
+    """Returns which of `num_all` tokens each of the last `num_new` tokens may attend to.
+
+    The result is [num_new, num_all], True where attention is allowed, or None when nothing
+    has to be hidden.
+    """
+    if num_new == 1:
+        # Decode: the single new token is the last one, so every token is in its past.
+        return None
+    # Prefill: new token i sits at position num_all - num_new + i and sees the tokens up to
+    # and including itself.
+    allowed = torch.ones(num_new, num_all, dtype=torch.bool, device=device)
+    return allowed.tril(diagonal=num_all - num_new)

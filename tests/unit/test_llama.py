@@ -4,11 +4,16 @@ import pytest
 import torch
 from torch import Tensor
 
+from kiyal.cache.contiguous import ContiguousKVCache
 from kiyal.model.config import ModelConfig
 from kiyal.model.llama import LlamaModel
 
 BATCH_SIZE = 2
 SEQ_LEN = 6
+# A cached forward multiplies matrices of other shapes than an uncached one, so its results
+# round differently in the last bits.
+CACHED_RTOL = 1e-5
+CACHED_ATOL = 1e-5
 
 
 @pytest.fixture
@@ -77,6 +82,92 @@ def test_shifting_all_positions_keeps_logits(model: LlamaModel) -> None:
 def test_spreading_positions_changes_logits(model: LlamaModel) -> None:
     input_ids, positions = token_batch(model.config)
     assert not torch.allclose(model(input_ids, positions * 2), model(input_ids, positions))
+
+
+def cached_logits(model: LlamaModel, input_ids: Tensor, positions: Tensor, chunks: list[int]):
+    """All-position logits from feeding the batch to a cached forward in pieces."""
+    batch_size, seq_len = input_ids.shape
+    cache = ContiguousKVCache(model.config, batch_size, seq_len)
+    pieces: list[Tensor] = []
+    for size in chunks:
+        piece = slice(cache.length, cache.length + size)
+        logits = model(
+            input_ids[:, piece], positions[:, piece], torch.arange(batch_size * size), cache
+        )
+        pieces.append(logits.view(batch_size, size, -1))
+    assert cache.length == seq_len
+    return torch.cat(pieces, dim=1)
+
+
+@torch.inference_mode()
+def test_prefill_into_a_cache_matches_the_uncached_forward(model: LlamaModel) -> None:
+    input_ids, positions = token_batch(model.config)
+    expected = all_logits(model, input_ids, positions)
+    torch.testing.assert_close(cached_logits(model, input_ids, positions, [SEQ_LEN]), expected)
+
+
+@pytest.mark.parametrize("prompt_len", [1, 3, SEQ_LEN - 1])
+@torch.inference_mode()
+def test_decoding_from_a_cache_matches_the_uncached_forward(
+    model: LlamaModel, prompt_len: int
+) -> None:
+    input_ids, positions = token_batch(model.config)
+    chunks = [prompt_len] + [1] * (SEQ_LEN - prompt_len)
+    expected = all_logits(model, input_ids, positions)
+    torch.testing.assert_close(
+        cached_logits(model, input_ids, positions, chunks),
+        expected,
+        rtol=CACHED_RTOL,
+        atol=CACHED_ATOL,
+    )
+
+
+@torch.inference_mode()
+def test_prefill_in_pieces_matches_the_uncached_forward(model: LlamaModel) -> None:
+    input_ids, positions = token_batch(model.config)
+    expected = all_logits(model, input_ids, positions)
+    torch.testing.assert_close(
+        cached_logits(model, input_ids, positions, [2, 3, 1]),
+        expected,
+        rtol=CACHED_RTOL,
+        atol=CACHED_ATOL,
+    )
+
+
+@torch.inference_mode()
+def test_a_cached_forward_returns_last_token_logits_by_default(model: LlamaModel) -> None:
+    input_ids, positions = token_batch(model.config)
+    cache = ContiguousKVCache(model.config, BATCH_SIZE, SEQ_LEN)
+    expected = all_logits(model, input_ids, positions)
+    prefill = model(input_ids[:, :4], positions[:, :4], cache=cache)
+    assert cache.length == 4
+    torch.testing.assert_close(prefill, expected[:, 3], rtol=CACHED_RTOL, atol=CACHED_ATOL)
+    decode = model(input_ids[:, 4:5], positions[:, 4:5], cache=cache)
+    assert cache.length == 5
+    torch.testing.assert_close(decode, expected[:, 4], rtol=CACHED_RTOL, atol=CACHED_ATOL)
+
+
+@torch.inference_mode()
+def test_cached_decoding_depends_on_the_cached_tokens(model: LlamaModel) -> None:
+    input_ids, positions = token_batch(model.config)
+    changed = input_ids.clone()
+    changed[:, 0] = (changed[:, 0] + 1) % model.config.vocab_size
+
+    def last_logits(prompt: Tensor) -> Tensor:
+        cache = ContiguousKVCache(model.config, BATCH_SIZE, SEQ_LEN)
+        model(prompt[:, :-1], positions[:, :-1], cache=cache)
+        return model(prompt[:, -1:], positions[:, -1:], cache=cache)
+
+    assert not torch.allclose(last_logits(changed), last_logits(input_ids))
+
+
+@torch.inference_mode()
+def test_a_forward_that_overflows_the_cache_raises(model: LlamaModel) -> None:
+    input_ids, positions = token_batch(model.config)
+    cache = ContiguousKVCache(model.config, BATCH_SIZE, SEQ_LEN - 1)
+    with pytest.raises(ValueError, match="cannot take 6 more"):
+        model(input_ids, positions, cache=cache)
+    assert cache.length == 0
 
 
 def test_tied_head_shares_the_embedding(model: LlamaModel) -> None:

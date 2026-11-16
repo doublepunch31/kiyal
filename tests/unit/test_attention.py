@@ -6,9 +6,15 @@ import torch
 from torch import Tensor
 from torch.nn.functional import linear
 
+from kiyal.cache.contiguous import ContiguousKVCache
 from kiyal.model.attention import Attention
 from kiyal.model.config import ModelConfig
 from kiyal.model.layers import RotaryEmbedding, apply_rotary_embedding
+
+# Attention over cached keys and values multiplies matrices of other shapes than attention
+# over a whole sequence, so its results round differently in the last bits.
+CACHED_RTOL = 1e-5
+CACHED_ATOL = 1e-5
 
 
 def reference_attention(attn: Attention, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
@@ -52,6 +58,45 @@ def test_matches_reference_attention(tiny_config: ModelConfig, kv_heads: int, bi
     attn = Attention(config)
     x, cos, sin = inputs(config)
     torch.testing.assert_close(attn(x, cos, sin), reference_attention(attn, x, cos, sin))
+
+
+@pytest.mark.parametrize("chunks", [(7,), (6, 1), (3, 4), (2, 3, 1, 1)])
+@pytest.mark.parametrize("kv_heads", [4, 2, 1], ids=["mha", "gqa", "mqa"])
+@torch.inference_mode()
+def test_cached_attention_matches_reference_attention(
+    tiny_config: ModelConfig, kv_heads: int, chunks: tuple[int, ...]
+) -> None:
+    # The sequence is fed in pieces: a first piece into an empty cache, then pieces of one
+    # token (decode) or several (a prefill that continues a cached prefix).
+    config = dataclasses.replace(tiny_config, num_key_value_heads=kv_heads)
+    torch.manual_seed(0)
+    attn = Attention(config)
+    x, cos, sin = inputs(config)
+    cache = ContiguousKVCache(config, x.shape[0], x.shape[1])
+    outputs: list[Tensor] = []
+    for size in chunks:
+        piece = slice(cache.length, cache.length + size)
+        outputs.append(attn(x[:, piece], cos[:, piece], sin[:, piece], cache))
+        cache.advance(size)
+    expected = reference_attention(attn, x, cos, sin)
+    torch.testing.assert_close(
+        torch.cat(outputs, dim=1), expected, rtol=CACHED_RTOL, atol=CACHED_ATOL
+    )
+
+
+@torch.inference_mode()
+def test_each_layer_reads_its_own_cached_keys_and_values(tiny_config: ModelConfig) -> None:
+    torch.manual_seed(0)
+    first, second = Attention(tiny_config), Attention(tiny_config)
+    x, cos, sin = inputs(tiny_config)
+    cache = ContiguousKVCache(tiny_config, x.shape[0], x.shape[1])
+    first(x[:, :-1], cos[:, :-1], sin[:, :-1], cache, layer_index=0)
+    second(x[:, :-1], cos[:, :-1], sin[:, :-1], cache, layer_index=1)
+    cache.advance(x.shape[1] - 1)
+
+    last = second(x[:, -1:], cos[:, -1:], sin[:, -1:], cache, layer_index=1)
+    expected = reference_attention(second, x, cos, sin)[:, -1:]
+    torch.testing.assert_close(last, expected, rtol=CACHED_RTOL, atol=CACHED_ATOL)
 
 
 @torch.inference_mode()
