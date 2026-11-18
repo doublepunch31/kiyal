@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from benchmarks import latency
+from benchmarks import latency, throughput
 from benchmarks.common import REPO_ROOT, capture_environment, median, save_result
 from kiyal.engine.generator import TextGenerator
 from kiyal.model.llama import LlamaModel
@@ -32,6 +32,7 @@ def test_environment_names_the_code_and_the_machine() -> None:
     assert (environment["device"], environment["dtype"]) == ("cpu", "float32")
     assert environment["cpu"]
     assert "gpu" not in environment
+    assert environment["power_source"] is None or isinstance(environment["power_source"], str)
     json.dumps(environment)
 
 
@@ -151,3 +152,104 @@ def test_the_default_run_covers_32_to_2048_output_tokens_with_the_cache(
     assert latency.main([*args, "--output", str(output)]) == 0
     assert requested == [[32, 64, 128, 256, 512, 1024, 2048]]
     assert json.loads(output.read_text())["engine"] == "cached"
+
+
+def test_batch_prompts_are_different_and_of_equal_length(tiny_tokenizer: Tokenizer) -> None:
+    prompts = throughput.build_prompts(tiny_tokenizer, 40, 5)
+    assert len(prompts) == 5
+    assert all(len(prompt) == 40 for prompt in prompts)
+    assert len({tuple(prompt) for prompt in prompts}) == 5
+    # Each prompt starts one token further into the same text.
+    assert prompts[1][:-1] == prompts[0][1:]
+
+
+def test_batch_timing_derives_the_per_step_metrics() -> None:
+    timing = throughput.BatchTiming(batch_size=4, output_tokens=11, total_s=2.0, ttft_s=0.5)
+    assert timing.step_s == pytest.approx(0.15)
+    assert timing.output_tokens_per_s == pytest.approx(22.0)
+
+
+def test_time_batch_times_every_row_to_the_requested_length(
+    generator: TextGenerator, tiny_tokenizer: Tokenizer
+) -> None:
+    prompts = throughput.build_prompts(tiny_tokenizer, 16, 3)
+    timing = throughput.time_batch(generator, prompts, 8, CPU)
+    assert (timing.batch_size, timing.output_tokens) == (3, 8)
+    assert 0 < timing.ttft_s < timing.total_s
+
+
+def test_time_batch_rejects_lengths_it_cannot_measure(
+    generator: TextGenerator, tiny_tokenizer: Tokenizer
+) -> None:
+    prompts = throughput.build_prompts(tiny_tokenizer, 16, 2)
+    with pytest.raises(ValueError, match="at least 2 output tokens"):
+        throughput.time_batch(generator, prompts, 1, CPU)
+    with pytest.raises(ValueError, match="context is too short"):
+        throughput.time_batch(generator, prompts, 200, CPU)
+
+
+def test_measure_warms_up_and_times_every_batch_size(
+    generator: TextGenerator, tiny_tokenizer: Tokenizer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    batch_sizes: list[int] = []
+    time_batch = throughput.time_batch
+
+    def recording_time_batch(generator, prompts, output_tokens, device):
+        batch_sizes.append(len(prompts))
+        return time_batch(generator, prompts, output_tokens, device)
+
+    monkeypatch.setattr(throughput, "time_batch", recording_time_batch)
+    settings = throughput.Settings(
+        prompt_tokens=16, output_tokens=4, batch_sizes=(1, 3), repeats=2, warmup=1
+    )
+    results = throughput.measure(generator, tiny_tokenizer, settings, CPU)
+    assert batch_sizes == [1, 1, 1, 3, 3, 3]
+    assert [entry["batch_size"] for entry in results] == [1, 3]
+    for entry in results:
+        runs, summary = entry["runs"], entry["median"]
+        assert isinstance(runs, list)
+        assert isinstance(summary, dict)
+        assert len(runs) == 2
+        assert summary["total_s"] == median([run["total_s"] for run in runs])
+        assert set(summary) == {"total_s", "ttft_s", "step_s", "output_tokens_per_s"}
+
+
+def test_throughput_main_saves_a_result_file(
+    tiny_model_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "throughput.json"
+    options = ["--device", "cpu", "--dtype", "fp32", "--prompt-tokens", "16", "--repeats", "2"]
+    args = ["--model", str(tiny_model_dir), *options, "--output-tokens", "4"]
+    assert throughput.main([*args, "--batch-sizes", "1", "2", "--output", str(output)]) == 0
+
+    result = json.loads(output.read_text())
+    assert (result["benchmark"], result["engine"]) == ("throughput", "static")
+    assert (result["prompt_tokens"], result["output_tokens"]) == (16, 4)
+    assert (result["repeats"], result["warmup"]) == (2, 1)
+    assert [entry["batch_size"] for entry in result["results"]] == [1, 2]
+    printed = capsys.readouterr().out
+    assert "tokens/s" in printed
+    assert f"saved {output}" in printed
+
+
+def test_the_default_throughput_run_covers_batch_sizes_1_to_64(
+    tiny_model_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requested: list[throughput.Settings] = []
+
+    def fake_measure(generator, tokenizer, settings, device):
+        requested.append(settings)
+        return []
+
+    monkeypatch.setattr(throughput, "measure", fake_measure)
+    output = tmp_path / "throughput.json"
+    assert throughput.main(["--model", str(tiny_model_dir), "--output", str(output)]) == 0
+    assert requested == [
+        throughput.Settings(
+            prompt_tokens=128,
+            output_tokens=128,
+            batch_sizes=(1, 2, 4, 8, 16, 32, 64),
+            repeats=3,
+            warmup=1,
+        )
+    ]

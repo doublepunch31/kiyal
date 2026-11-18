@@ -1,9 +1,12 @@
 """Renders benchmark results as a chart (PNG) and a table (markdown).
 
-Run from the repository root with the result files of both engines:
+Run from the repository root, with the latency results of both engines or one throughput
+result:
 
     uv run python -m benchmarks.plot latency benchmarks/results/latency-*-cpu.json \
         --output benchmarks/results/latency-cpu
+    uv run python -m benchmarks.plot throughput benchmarks/results/throughput-static-cpu.json \
+        --output benchmarks/results/throughput-cpu
 """
 
 import argparse
@@ -20,6 +23,8 @@ from matplotlib.ticker import FuncFormatter, NullLocator
 # Engines in the order they are drawn and listed. Each keeps its color in every chart.
 ENGINE_COLORS = {"cached": "#2a78d6", "naive": "#eb6834"}
 ENGINE_LABELS = {"cached": "KV cache", "naive": "naive (no cache)"}
+# Static batching decodes with the KV cache, so it keeps the cache's color.
+STATIC_COLOR = ENGINE_COLORS["cached"]
 SURFACE = "#fcfcfb"
 TEXT = "#0b0b0b"
 MUTED_TEXT = "#52514e"
@@ -90,9 +95,15 @@ def describe(results: dict[str, Result]) -> str:
     hardware = environment.get("gpu") or environment["cpu"]
     repeats = result["repeats"]
     runs = "1 run" if repeats == 1 else f"median of {repeats} runs"
+    workload = f"{result['prompt_tokens']}-token prompt"
+    # Latency results vary the output length; throughput results fix it.
+    if "output_tokens" in result:
+        workload = (
+            f"{result['prompt_tokens']}-token prompts, {result['output_tokens']} output tokens"
+        )
     return (
         f"{model}, {environment['device']} {environment['dtype']}, {hardware}, "
-        f"{result['prompt_tokens']}-token prompt, greedy, {runs}"
+        f"{workload}, greedy, {runs}"
     )
 
 
@@ -138,14 +149,15 @@ def plot_latency(results: dict[str, Result], path: Path) -> Path:
     for engine, result in results.items():
         speeds = medians(result, "output_tokens_per_s")
         times = medians(result, "total_s")
-        _draw_series(speed_axes, speeds, engine, f"{speeds[max(speeds)]:.1f}")
-        _draw_series(time_axes, times, engine, f"{times[max(times)]:,.1f} s")
+        color, label = ENGINE_COLORS[engine], ENGINE_LABELS[engine]
+        _draw_series(speed_axes, speeds, color, label, f"{speeds[max(speeds)]:.1f}")
+        _draw_series(time_axes, times, color, label, f"{times[max(times)]:,.1f} s")
 
-    _style_axes(speed_axes, lengths, "Output tokens per second")
+    _style_axes(speed_axes, lengths, "Output tokens per second", "output tokens")
     speed_axes.set_ylim(bottom=0)
     speed_axes.legend(frameon=False, labelcolor=TEXT, loc="center left", fontsize=9)
 
-    _style_axes(time_axes, lengths, "Total time in seconds (log scale)")
+    _style_axes(time_axes, lengths, "Total time in seconds (log scale)", "output tokens")
     time_axes.set_yscale("log")
     time_axes.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}"))
     time_axes.yaxis.set_minor_locator(NullLocator())
@@ -173,13 +185,101 @@ def plot_latency(results: dict[str, Result], path: Path) -> Path:
     return path
 
 
-def _draw_series(axes: Axes, values: dict[int, float], engine: str, end_label: str) -> None:
+def load_throughput_result(path: Path) -> Result:
+    """Reads a throughput result file.
+
+    Raises:
+        ValueError: If the file is not a throughput result.
+    """
+    result = json.loads(path.read_text())
+    if result.get("benchmark") != "throughput":
+        raise ValueError(f"{path} is not a throughput result")
+    return result
+
+
+def batch_medians(result: Result, metric: str) -> dict[int, float]:
+    """Returns the median of a metric for each batch size of a throughput result."""
+    return {entry["batch_size"]: entry["median"][metric] for entry in result["results"]}
+
+
+def throughput_table(result: Result) -> str:
+    """Renders a throughput result as a markdown table with one row per batch size.
+
+    The "x batch" columns compare each batch size with the smallest one.
+    """
+    speeds = batch_medians(result, "output_tokens_per_s")
+    steps = batch_medians(result, "step_s")
+    ttfts = batch_medians(result, "ttft_s")
+    smallest = min(speeds)
+    header = [
+        "batch size",
+        "output tokens/s",
+        f"x batch {smallest}",
+        "step ms",
+        f"x batch {smallest}",
+        "TTFT ms",
+    ]
+    lines = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
+    for size in sorted(speeds):
+        row = [
+            str(size),
+            f"{speeds[size]:.1f}",
+            f"{speeds[size] / speeds[smallest]:.2f}",
+            f"{steps[size] * 1e3:.1f}",
+            f"{steps[size] / steps[smallest]:.2f}",
+            f"{ttfts[size] * 1e3:.0f}",
+        ]
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def plot_throughput(result: Result, path: Path) -> Path:
+    """Draws throughput and the time per decoding step against batch size."""
+    figure = Figure(figsize=(10.5, 4.6), dpi=160, facecolor=SURFACE)
+    speed_axes, step_axes = figure.subplots(1, 2)
+    speeds = batch_medians(result, "output_tokens_per_s")
+    steps_ms = {size: step * 1e3 for size, step in batch_medians(result, "step_s").items()}
+    sizes = sorted(speeds)
+    label = "static batching, KV cache"
+
+    _draw_series(speed_axes, speeds, STATIC_COLOR, label, f"{speeds[sizes[-1]]:,.0f}")
+    _style_axes(speed_axes, sizes, "Output tokens per second", "batch size")
+    speed_axes.set_ylim(bottom=0)
+    _draw_series(step_axes, steps_ms, STATIC_COLOR, label, f"{steps_ms[sizes[-1]]:.1f} ms")
+    _style_axes(step_axes, sizes, "Time per decoding step in ms", "batch size")
+    step_axes.set_ylim(bottom=0)
+    # The trade-off in numbers: how much more throughput, for how much slower steps.
+    if len(sizes) > 1:
+        first, last = sizes[0], sizes[-1]
+        note = (
+            f"batch {first} to {last}: throughput x{speeds[last] / speeds[first]:.1f}, "
+            f"step time x{steps_ms[last] / steps_ms[first]:.1f}"
+        )
+        step_axes.text(
+            0.0, 1.03, note, transform=step_axes.transAxes,
+            color=MUTED_TEXT, fontsize=9, va="bottom",
+        )  # fmt: skip
+
+    figure.suptitle(
+        "Static batching: throughput against batch size",
+        x=0.06, y=0.97, ha="left", color=TEXT, fontsize=13, fontweight="bold",
+    )  # fmt: skip
+    figure.text(0.06, 0.885, describe({"static": result}), color=MUTED_TEXT, fontsize=9)
+    figure.subplots_adjust(left=0.06, right=0.97, top=0.74, bottom=0.12, wspace=0.16)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path)
+    return path
+
+
+def _draw_series(
+    axes: Axes, values: dict[int, float], color: str, label: str, end_label: str
+) -> None:
     lengths = sorted(values)
     axes.plot(
         lengths,
         [values[length] for length in lengths],
-        color=ENGINE_COLORS[engine],
-        label=ENGINE_LABELS[engine],
+        color=color,
+        label=label,
         linewidth=2,
         marker="o",
         markersize=6.5,
@@ -202,11 +302,11 @@ def _draw_series(axes: Axes, values: dict[int, float], engine: str, end_label: s
     )
 
 
-def _style_axes(axes: Axes, lengths: Sequence[int], title: str) -> None:
+def _style_axes(axes: Axes, lengths: Sequence[int], title: str, xlabel: str) -> None:
     axes.set_facecolor(SURFACE)
     axes.set_title(title, loc="left", color=TEXT, fontsize=10, pad=24)
-    axes.set_xlabel("output tokens", color=MUTED_TEXT, fontsize=9)
-    # Lengths double from point to point, so a log scale spaces them evenly.
+    axes.set_xlabel(xlabel, color=MUTED_TEXT, fontsize=9)
+    # Values double from point to point, so a log scale spaces them evenly.
     axes.set_xscale("log", base=2)
     axes.set_xticks(list(lengths), [str(length) for length in lengths])
     axes.xaxis.set_minor_locator(NullLocator())
@@ -232,12 +332,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     latency.add_argument(
         "--output", type=Path, required=True, help="path of the chart and table, without suffix"
     )
+    throughput = commands.add_parser("throughput", help="static batching across batch sizes")
+    throughput.add_argument("result", type=Path, help="throughput result file")
+    throughput.add_argument(
+        "--output", type=Path, required=True, help="path of the chart and table, without suffix"
+    )
     args = parser.parse_args(argv)
 
-    results = load_latency_results(args.results)
-    chart = plot_latency(results, args.output.with_name(args.output.name + ".png"))
+    chart = args.output.with_name(args.output.name + ".png")
     table = args.output.with_name(args.output.name + ".md")
-    table.write_text(f"{describe(results)}\n\n{latency_table(results)}")
+    if args.command == "latency":
+        results = load_latency_results(args.results)
+        plot_latency(results, chart)
+        table.write_text(f"{describe(results)}\n\n{latency_table(results)}")
+    else:
+        result = load_throughput_result(args.result)
+        plot_throughput(result, chart)
+        table.write_text(f"{describe({'static': result})}\n\n{throughput_table(result)}")
     print(f"saved {chart}")
     print(f"saved {table}")
     return 0

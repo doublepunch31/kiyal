@@ -44,6 +44,7 @@ def capture_environment(device: torch.device, dtype: torch.dtype) -> dict[str, o
         "platform": platform.platform(),
         "cpu": _cpu_name(),
         "cpu_threads": torch.get_num_threads(),
+        "power_source": _power_source(),
         "torch": torch.__version__,
         "device": str(device),
         "dtype": str(dtype).removeprefix("torch."),
@@ -90,3 +91,17 @@ def _cpu_name() -> str:
             if line.startswith("model name"):
                 return line.split(":", 1)[1].strip()
     return platform.processor() or platform.machine()
+
+
+def _power_source() -> str | None:
+    """Returns "AC Power" or "Battery Power" on macOS, and None elsewhere.
+
+    Recorded so that laptop runs on battery and on AC power can be told apart.
+    """
+    if platform.system() != "Darwin":
+        return None
+    # The first line of `pmset -g batt` reads: Now drawing from 'AC Power'
+    line = _command_output(["pmset", "-g", "batt"])
+    if line is None or line.count("'") < 2:
+        return None
+    return line.split("'")[1]

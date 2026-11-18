@@ -16,13 +16,16 @@ Early development. Implemented so far:
   token boundaries
 - a KV cache: the keys and values of every layer are kept in one preallocated tensor, so the
   prompt runs through the model once and each later step runs on a single new token
+- static batching: prompts of different lengths are padded at the start into one batch, with the
+  padding hidden from attention and positions counted per row, so each prompt gets the tokens it
+  would get alone
 - `kiyal generate`, which streams text decoded with the KV cache. The loop that recomputes the
   whole sequence at every step is kept as the baseline for tests and benchmarks.
 
 On SmolLM2-135M-Instruct in fp32 on CPU, the model's logits match `transformers` within 1e-4, and
 greedy generation for a chat prompt gives the same tokens as `transformers`' `generate()`. Decoding
-with the KV cache gives the same tokens as decoding without it. Batching and the server are not
-implemented yet.
+with the KV cache gives the same tokens as decoding without it, and a batch gives each prompt the
+same tokens as decoding it alone. Continuous batching and the server are not implemented yet.
 
 ## Setup
 
@@ -58,6 +61,11 @@ uv run kiyal generate --model HuggingFaceTB/SmolLM2-135M-Instruct \
 
 ## Benchmarks
 
+All numbers below were measured on a laptop (Apple M4, on battery power). None are NVIDIA GPU
+numbers.
+
+### KV cache
+
 One request with a 128-token prompt, decoded greedily with and without the KV cache.
 SmolLM2-135M-Instruct in fp32 on a laptop CPU (Apple M4), median of 3 runs. These are not GPU
 numbers.
@@ -79,7 +87,51 @@ on the whole sequence, so total time follows the sum of the sequence lengths: do
 multiplies it by 2.2 for short outputs, where the 128-token prompt is most of the sequence, and by
 3.7 from 1024 to 2048 tokens, close to the factor of 4 of quadratic growth.
 
-The result files and the full table are in [benchmarks/results/](benchmarks/results/).
+### Static batching
+
+B different 128-token prompts decoded together, 128 greedy output tokens each, with the KV cache.
+Batch sizes 1 to 64, median of 3 runs after one warm-up at each size. A step gives every prompt
+its next token, so the step time is also each prompt's time per output token.
+
+On the M4 GPU through MPS (fp16):
+
+![Throughput and step time against batch size on the M4 GPU](benchmarks/results/throughput-mps.png)
+
+| batch size | output tokens/s | x batch 1 | step ms | x batch 1 | TTFT ms |
+|---|---|---|---|---|---|
+| 1 | 108.4 | 1.00 | 9.0 | 1.00 | 31 |
+| 2 | 173.6 | 1.60 | 11.3 | 1.25 | 43 |
+| 4 | 331.6 | 3.06 | 11.6 | 1.28 | 73 |
+| 8 | 583.7 | 5.38 | 12.7 | 1.41 | 134 |
+| 16 | 812.8 | 7.50 | 17.8 | 1.96 | 264 |
+| 32 | 1295.9 | 11.95 | 20.9 | 2.31 | 511 |
+| 64 | 1829.1 | 16.87 | 27.3 | 3.02 | 1012 |
+
+Much of a decoding step's cost does not grow with the batch: every weight is read once per step,
+and the fixed cost of running each layer is paid once. Up to batch 8, extra rows share that cost
+almost for free: 8 times the tokens per step for a step 1.4 times as long. From batch 16 the step time grows faster, and
+batch 64 gives 16.9 times the throughput of batch 1 for steps 3 times as long. The time to the
+first token grows with the batch, because every prompt is prefilled before the first step.
+
+On the CPU (fp32, 4 threads):
+
+| batch size | output tokens/s | x batch 1 | step ms | x batch 1 | TTFT ms |
+|---|---|---|---|---|---|
+| 1 | 92.1 | 1.00 | 10.5 | 1.00 | 53 |
+| 2 | 62.7 | 0.68 | 31.4 | 2.99 | 83 |
+| 4 | 127.5 | 1.38 | 30.5 | 2.90 | 138 |
+| 8 | 186.6 | 2.03 | 41.1 | 3.90 | 271 |
+| 16 | 369.1 | 4.01 | 39.5 | 3.75 | 531 |
+| 32 | 604.0 | 6.56 | 44.9 | 4.27 | 1077 |
+| 64 | 816.3 | 8.86 | 62.3 | 5.92 | 2127 |
+
+Batch 2 is slower than batch 1 on the CPU. The time goes into the linear layers: with PyTorch's
+Accelerate backend on this machine, multiplying 2 to 16 rows by a weight stored as [out, in]
+took about 200 µs for a 1536 x 576 weight, against 8 µs for one row and 20 µs for the same rows
+with the weight stored transposed. From batch 2 on, the step time grows slowly again.
+
+The result files, the CPU chart and the full tables are in
+[benchmarks/results/](benchmarks/results/).
 
 ## Development
 
@@ -98,7 +150,8 @@ Every optimization is tested for equivalence with the simpler path it replaces. 
 the first step: at every decoding step the cached logits must match the uncached ones within a
 tolerance, and greedy generation must give the same tokens. Steps where the two best tokens are
 closer than twice the tolerance are near ties that rounding can flip, so the token comparison
-stops at the first one.
+stops at the first one. Static batching is the second: each row of a padded batch must match its
+prompt decoded alone with the KV cache, in the same way.
 
 ```sh
 # Single-request decoding speed at several output lengths, saved as JSON in benchmarks/raw/.
@@ -109,6 +162,11 @@ uv run python -m benchmarks.latency --model HuggingFaceTB/SmolLM2-135M-Instruct 
 # Chart (PNG) and table (markdown) from one result file per engine.
 uv run python -m benchmarks.plot latency benchmarks/results/latency-*-cpu.json \
     --output benchmarks/results/latency-cpu
+
+# Static batching throughput at batch sizes 1 to 64, then its chart and table.
+uv run python -m benchmarks.throughput --model HuggingFaceTB/SmolLM2-135M-Instruct --device cpu
+uv run python -m benchmarks.plot throughput benchmarks/results/throughput-static-cpu.json \
+    --output benchmarks/results/throughput-cpu
 ```
 
 ## License

@@ -149,3 +149,79 @@ def test_main_writes_the_chart_and_the_table(
     assert chart.read_bytes().startswith(PNG_SIGNATURE)
     assert table.read_text() == f"{plot.describe(results)}\n\n{plot.latency_table(results)}"
     assert capsys.readouterr().out == f"saved {chart}\nsaved {table}\n"
+
+
+def throughput_result(timings: dict[int, tuple[float, float, float]]) -> plot.Result:
+    """A throughput result in the shape that benchmarks.throughput saves.
+
+    Args:
+        timings: Output tokens/s, step time and TTFT in seconds for each batch size.
+    """
+    return {
+        "benchmark": "throughput",
+        "engine": "static",
+        "model": "org/tiny-model",
+        "revision": None,
+        "prompt_tokens": 128,
+        "output_tokens": 64,
+        "repeats": 3,
+        "environment": {"device": "cpu", "dtype": "float32", "cpu": "Test CPU", "torch": "2.15.0"},
+        "results": [
+            {
+                "batch_size": size,
+                "median": {"output_tokens_per_s": speed, "step_s": step, "ttft_s": ttft},
+            }
+            for size, (speed, step, ttft) in timings.items()
+        ],
+    }
+
+
+@pytest.fixture
+def batches() -> plot.Result:
+    return throughput_result(
+        {1: (100.0, 0.01, 0.05), 2: (180.0, 0.011, 0.09), 4: (300.0, 0.0125, 0.2)}
+    )
+
+
+def test_a_throughput_result_is_loaded(tmp_path: Path, batches: plot.Result) -> None:
+    assert plot.load_throughput_result(write(tmp_path / "t.json", batches)) == batches
+
+
+def test_a_latency_result_is_not_a_throughput_result(
+    tmp_path: Path, results: dict[str, plot.Result]
+) -> None:
+    with pytest.raises(ValueError, match="not a throughput result"):
+        plot.load_throughput_result(write(tmp_path / "l.json", results["cached"]))
+
+
+def test_the_throughput_description_names_the_output_length(batches: plot.Result) -> None:
+    assert plot.describe({"static": batches}) == (
+        "tiny-model, cpu float32, Test CPU, 128-token prompts, 64 output tokens, greedy, "
+        "median of 3 runs"
+    )
+
+
+def test_the_throughput_table_compares_each_batch_with_the_smallest(batches: plot.Result) -> None:
+    assert plot.throughput_table(batches).splitlines() == [
+        "| batch size | output tokens/s | x batch 1 | step ms | x batch 1 | TTFT ms |",
+        "|---|---|---|---|---|---|",
+        "| 1 | 100.0 | 1.00 | 10.0 | 1.00 | 50 |",
+        "| 2 | 180.0 | 1.80 | 11.0 | 1.10 | 90 |",
+        "| 4 | 300.0 | 3.00 | 12.5 | 1.25 | 200 |",
+    ]
+
+
+def test_main_writes_the_throughput_chart_and_table(
+    tmp_path: Path, batches: plot.Result, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "out" / "throughput-cpu"
+    assert (
+        plot.main(["throughput", str(write(tmp_path / "t.json", batches)), "--output", str(output)])
+        == 0
+    )
+
+    chart, table = output.with_name("throughput-cpu.png"), output.with_name("throughput-cpu.md")
+    assert chart.read_bytes().startswith(PNG_SIGNATURE)
+    expected = f"{plot.describe({'static': batches})}\n\n{plot.throughput_table(batches)}"
+    assert table.read_text() == expected
+    assert capsys.readouterr().out == f"saved {chart}\nsaved {table}\n"
