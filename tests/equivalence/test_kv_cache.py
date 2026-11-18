@@ -12,6 +12,7 @@ from kiyal.model.llama import LlamaModel
 from kiyal.model.loader import load_model
 from kiyal.tokenizer import Tokenizer
 from tests.equivalence.greedy import assert_greedy_equivalent, near_tie_steps
+from tests.equivalence.prompts import SMOLLM2_PROMPTS, TINY_TEXTS, TINY_VARIANTS, encode_prompt
 
 CPU = torch.device("cpu")
 # Largest differences between cached and uncached logits measured on an Apple M4: 2.7e-6 on
@@ -19,29 +20,6 @@ CPU = torch.device("cpu")
 # leave about 7x room for other BLAS libraries, which round differently.
 TINY_ATOL = 2e-5
 SMOLLM2_ATOL = 1e-3
-
-TINY_VARIANTS: dict[str, dict[str, object]] = {
-    "gqa": {},
-    "mha": {"num_key_value_heads": 4},
-    "mqa": {"num_key_value_heads": 1},
-    "attention-bias": {"attention_bias": True},
-}
-TINY_TEXTS = {
-    "english": "the cat sat on",
-    "russian": "мама мыла раму",
-    "kyrgyz": "кыял деген эмне",
-    "chinese": "你好世界",
-}
-SMOLLM2_PROMPTS: dict[str, str | list[dict[str, str]]] = {
-    "short": "The capital of France is",
-    "code": "def fibonacci(n):\n",
-    "paragraph": (
-        "A KV cache stores the attention keys and values of the tokens a model has already "
-        "processed. Each decoding step then computes keys and values for one new token "
-        "only and attends over the stored ones. Without the cache, every step would"
-    ),
-    "chat": [{"role": "user", "content": "What is the boiling point of water at sea level?"}],
-}
 
 
 @torch.inference_mode()
@@ -122,20 +100,6 @@ def assert_same_generation(
     assert actual[:comparable] == expected[:comparable]
     if not near_ties:
         assert len(actual) == len(expected)
-
-
-@pytest.fixture(scope="module")
-def smollm2(smollm2_checkpoint: Path) -> LlamaModel:
-    return load_model(smollm2_checkpoint, device=CPU, dtype=torch.float32)
-
-
-@pytest.fixture(scope="module")
-def smollm2_kiyal_tokenizer(smollm2_checkpoint: Path) -> Tokenizer:
-    return Tokenizer.from_dir(smollm2_checkpoint)
-
-
-def encode_prompt(tokenizer: Tokenizer, prompt: str | list[dict[str, str]]) -> list[int]:
-    return tokenizer.encode(prompt) if isinstance(prompt, str) else tokenizer.encode_chat(prompt)
 
 
 @pytest.mark.slow
