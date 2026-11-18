@@ -29,10 +29,13 @@ def token_batch(config: ModelConfig) -> tuple[Tensor, Tensor]:
     return input_ids, positions
 
 
-def all_logits(model: LlamaModel, input_ids: Tensor, positions: Tensor) -> Tensor:
+def all_logits(
+    model: LlamaModel, input_ids: Tensor, positions: Tensor, left_padding: Tensor | None = None
+) -> Tensor:
     batch_size, seq_len = input_ids.shape
     indices = torch.arange(batch_size * seq_len)
-    return model(input_ids, positions, indices).view(batch_size, seq_len, -1)
+    logits = model(input_ids, positions, indices, left_padding=left_padding)
+    return logits.view(batch_size, seq_len, -1)
 
 
 @torch.inference_mode()
@@ -168,6 +171,86 @@ def test_a_forward_that_overflows_the_cache_raises(model: LlamaModel) -> None:
     with pytest.raises(ValueError, match="cannot take 6 more"):
         model(input_ids, positions, cache=cache)
     assert cache.length == 0
+
+
+PADDED_LENGTHS = [2, 6, 4]
+
+
+def padded_batch(config: ModelConfig, seed: int = 0) -> tuple[list[Tensor], Tensor, Tensor, Tensor]:
+    """Rows of PADDED_LENGTHS random tokens, left-padded with random tokens to one length.
+
+    Returns:
+        Each row's [T_b] tokens, and the [B, T] padded tokens, [B, T] positions and [B] left
+        padding of the batch.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    longest = max(PADDED_LENGTHS)
+    rows = [torch.randint(0, config.vocab_size, (n,), generator=generator) for n in PADDED_LENGTHS]
+    padding = [longest - len(row) for row in rows]
+    filler = torch.randint(0, config.vocab_size, (len(rows), longest), generator=generator)
+    input_ids = torch.stack(
+        [
+            torch.cat([filler[b, :n], row])
+            for b, (row, n) in enumerate(zip(rows, padding, strict=True))
+        ]
+    )
+    left_padding = torch.tensor(padding)
+    positions = (torch.arange(longest) - left_padding.unsqueeze(-1)).clamp(min=0)
+    return rows, input_ids, positions, left_padding
+
+
+@torch.inference_mode()
+def test_a_padded_row_gets_the_logits_it_gets_alone(model: LlamaModel) -> None:
+    rows, input_ids, positions, left_padding = padded_batch(model.config)
+    batched = all_logits(model, input_ids, positions, left_padding)
+    for b, row in enumerate(rows):
+        alone = all_logits(model, row.unsqueeze(0), torch.arange(len(row)).unsqueeze(0))
+        torch.testing.assert_close(
+            batched[b, left_padding[b] :], alone[0], rtol=CACHED_RTOL, atol=CACHED_ATOL
+        )
+
+
+@torch.inference_mode()
+def test_padding_tokens_do_not_change_the_logits_of_the_tokens(model: LlamaModel) -> None:
+    _, input_ids, positions, left_padding = padded_batch(model.config)
+    _, refilled, _, _ = padded_batch(model.config, seed=1)
+    is_padding = torch.arange(input_ids.shape[1]) < left_padding.unsqueeze(-1)
+    changed = torch.where(is_padding, refilled, input_ids)
+    assert not torch.equal(changed, input_ids)
+    before = all_logits(model, input_ids, positions, left_padding)
+    after = all_logits(model, changed, positions, left_padding)
+    # Masked slots get a weight of exactly 0, so the token rows are unchanged to the bit.
+    assert torch.equal(after[~is_padding], before[~is_padding])
+
+
+@torch.inference_mode()
+def test_a_padded_batch_decodes_from_a_cache_like_each_row_alone(model: LlamaModel) -> None:
+    rows, input_ids, positions, left_padding = padded_batch(model.config)
+    num_decode = 3
+    generator = torch.Generator().manual_seed(2)
+    new_tokens = torch.randint(
+        0, model.config.vocab_size, (len(rows), num_decode), generator=generator
+    )
+    cache = ContiguousKVCache(model.config, len(rows), input_ids.shape[1] + num_decode)
+    steps = [model(input_ids, positions, cache=cache, left_padding=left_padding)]  # prefill
+    for step in range(num_decode):
+        step_positions = positions[:, -1:] + step + 1  # [B, 1]
+        steps.append(
+            model(
+                new_tokens[:, step : step + 1],
+                step_positions,
+                cache=cache,
+                left_padding=left_padding,
+            )
+        )
+    batched = torch.stack(steps, dim=1)  # [B, 1 + num_decode, V]
+
+    for b, row in enumerate(rows):
+        sequence = torch.cat([row, new_tokens[b]]).unsqueeze(0)  # [1, T_b + num_decode]
+        alone = all_logits(model, sequence, torch.arange(sequence.shape[1]).unsqueeze(0))
+        torch.testing.assert_close(
+            batched[b], alone[0, len(row) - 1 :], rtol=CACHED_RTOL, atol=CACHED_ATOL
+        )
 
 
 def test_tied_head_shares_the_embedding(model: LlamaModel) -> None:

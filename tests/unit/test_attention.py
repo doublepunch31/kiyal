@@ -7,7 +7,7 @@ from torch import Tensor
 from torch.nn.functional import linear
 
 from kiyal.cache.contiguous import ContiguousKVCache
-from kiyal.model.attention import Attention
+from kiyal.model.attention import Attention, padded_causal_mask
 from kiyal.model.config import ModelConfig
 from kiyal.model.layers import RotaryEmbedding, apply_rotary_embedding
 
@@ -87,16 +87,85 @@ def test_cached_attention_matches_reference_attention(
 @torch.inference_mode()
 def test_each_layer_reads_its_own_cached_keys_and_values(tiny_config: ModelConfig) -> None:
     torch.manual_seed(0)
-    first, second = Attention(tiny_config), Attention(tiny_config)
+    first, second = Attention(tiny_config), Attention(tiny_config, layer_index=1)
     x, cos, sin = inputs(tiny_config)
     cache = ContiguousKVCache(tiny_config, x.shape[0], x.shape[1])
-    first(x[:, :-1], cos[:, :-1], sin[:, :-1], cache, layer_index=0)
-    second(x[:, :-1], cos[:, :-1], sin[:, :-1], cache, layer_index=1)
+    first(x[:, :-1], cos[:, :-1], sin[:, :-1], cache)
+    second(x[:, :-1], cos[:, :-1], sin[:, :-1], cache)
     cache.advance(x.shape[1] - 1)
 
-    last = second(x[:, -1:], cos[:, -1:], sin[:, -1:], cache, layer_index=1)
+    last = second(x[:, -1:], cos[:, -1:], sin[:, -1:], cache)
     expected = reference_attention(second, x, cos, sin)[:, -1:]
     torch.testing.assert_close(last, expected, rtol=CACHED_RTOL, atol=CACHED_ATOL)
+
+
+def test_the_padded_mask_hides_padding_and_later_slots() -> None:
+    # Row 0 has no padding, row 1 starts with two padding slots.
+    mask = padded_causal_mask(4, 0, torch.tensor([0, 2]))
+    assert mask.shape == (2, 1, 4, 4)
+    assert mask[0, 0].int().tolist() == [[1, 0, 0, 0], [1, 1, 0, 0], [1, 1, 1, 0], [1, 1, 1, 1]]
+    # Padding slots see only themselves; tokens never see padding.
+    assert mask[1, 0].int().tolist() == [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 1, 1]]
+
+
+def test_the_padded_mask_after_cached_slots() -> None:
+    # Two new tokens after four cached slots, with one and three padding slots.
+    mask = padded_causal_mask(2, 4, torch.tensor([1, 3]))
+    assert mask.shape == (2, 1, 2, 6)
+    assert mask[0, 0].int().tolist() == [[0, 1, 1, 1, 1, 0], [0, 1, 1, 1, 1, 1]]
+    assert mask[1, 0].int().tolist() == [[0, 0, 0, 1, 1, 0], [0, 0, 0, 1, 1, 1]]
+
+
+def padded_inputs(config: ModelConfig, num_padding: int) -> tuple[Tensor, ...]:
+    """A batch of two rows of 10 slots, the first of which starts with padding.
+
+    Returns:
+        The [2, 10, hidden] batch, its cos and sin, and the [2] left padding. The positions
+        count from each row's first token, so a row's token slots have the cos and sin it
+        would have alone.
+    """
+    seq_len = 10
+    generator = torch.Generator().manual_seed(1)
+    x = torch.randn(2, seq_len, config.hidden_size, generator=generator)
+    rope = RotaryEmbedding(config.head_dim, config.max_position_embeddings, config.rope_theta)
+    left_padding = torch.tensor([num_padding, 0])
+    slots = torch.arange(seq_len)
+    positions = (slots - left_padding.unsqueeze(-1)).clamp(min=0)
+    cos, sin = rope(positions, torch.float32)
+    return x, cos, sin, left_padding
+
+
+@pytest.mark.parametrize("chunks", [None, (10,), (2, 8), (5, 1, 3, 1)], ids=str)
+@pytest.mark.parametrize("kv_heads", [4, 2, 1], ids=["mha", "gqa", "mqa"])
+@torch.inference_mode()
+def test_padding_does_not_change_the_attention_of_tokens(
+    tiny_config: ModelConfig, kv_heads: int, chunks: tuple[int, ...] | None
+) -> None:
+    # None runs without a cache; otherwise the slots are fed to a cache in pieces, and a
+    # piece of (2, 8) holds only padding in row 0.
+    config = dataclasses.replace(tiny_config, num_key_value_heads=kv_heads)
+    torch.manual_seed(0)
+    attn = Attention(config)
+    num_padding = 3
+    x, cos, sin, left_padding = padded_inputs(config, num_padding)
+    if chunks is None:
+        out = attn(x, cos, sin, mask=padded_causal_mask(x.shape[1], 0, left_padding))
+    else:
+        cache = ContiguousKVCache(config, x.shape[0], x.shape[1])
+        outputs: list[Tensor] = []
+        for size in chunks:
+            piece = slice(cache.length, cache.length + size)
+            mask = padded_causal_mask(size, cache.length, left_padding)
+            outputs.append(attn(x[:, piece], cos[:, piece], sin[:, piece], cache, mask))
+            cache.advance(size)
+        out = torch.cat(outputs, dim=1)
+
+    assert torch.isfinite(out).all()
+    tokens = slice(num_padding, None)
+    alone = reference_attention(attn, x[:1, tokens], cos[:1, tokens], sin[:1, tokens])
+    torch.testing.assert_close(out[:1, tokens], alone, rtol=CACHED_RTOL, atol=CACHED_ATOL)
+    unpadded = reference_attention(attn, x[1:], cos[1:], sin[1:])
+    torch.testing.assert_close(out[1:], unpadded, rtol=CACHED_RTOL, atol=CACHED_ATOL)
 
 
 @torch.inference_mode()

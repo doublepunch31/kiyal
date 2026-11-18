@@ -266,3 +266,88 @@ def test_each_step_runs_in_inference_mode_without_leaking_it(
     assert in_forward == [True]
     # The caller runs between steps and must not inherit the mode.
     assert not torch.is_inference_mode_enabled()
+
+
+BATCH_TEXTS = ["the cat sat on", "мама мыла раму", "你好", "кыял деген эмне, кыял"]
+
+
+@pytest.fixture(scope="module")
+def batch_prompts(tiny_tokenizer: Tokenizer) -> list[list[int]]:
+    prompts = [tiny_tokenizer.encode(text) for text in BATCH_TEXTS]
+    # Different lengths, so that every row but the longest starts with padding.
+    assert len({len(prompt) for prompt in prompts}) == len(prompts)
+    return prompts
+
+
+def row_steps(batch: list[list[GenerationStep | None]], row: int) -> list[GenerationStep | None]:
+    return [steps[row] for steps in batch]
+
+
+def test_each_row_of_a_batch_generates_what_it_generates_alone(
+    generator: TextGenerator, batch_prompts: list[list[int]]
+) -> None:
+    params = [
+        GREEDY,
+        dataclasses.replace(GREEDY, max_tokens=7),
+        SamplingParams(max_tokens=30, seed=5, ignore_eos=True),
+        dataclasses.replace(GREEDY, max_tokens=16, repetition_penalty=1.3, frequency_penalty=1.0),
+    ]
+    batch = list(generator.generate_batch(batch_prompts, params))
+    alone = [list(generator.generate(p, sp)) for p, sp in zip(batch_prompts, params, strict=True)]
+    assert len(batch) == max(len(steps) for steps in alone)
+    for row, expected in enumerate(alone):
+        # A finished row has no step until the batch ends.
+        padding = [None] * (len(batch) - len(expected))
+        assert row_steps(batch, row) == [*expected, *padding]
+
+
+def test_the_batch_ends_with_its_last_output(
+    generator: TextGenerator, batch_prompts: list[list[int]]
+) -> None:
+    params = [dataclasses.replace(GREEDY, max_tokens=n) for n in (3, 6)]
+    batch = list(generator.generate_batch(batch_prompts[:2], params))
+    assert len(batch) == 6
+    first, second = row_steps(batch, 0), row_steps(batch, 1)
+    assert first[3:] == [None, None, None]
+    assert [step and step.finish_reason for step in first[:3]] == [None, None, FinishReason.LENGTH]
+    assert all(step is not None for step in second)
+    assert second[-1] is not None and second[-1].finish_reason is FinishReason.LENGTH
+
+
+def test_a_batch_runs_the_model_on_the_padded_prompts_then_one_token_per_row(
+    generator: TextGenerator, model: LlamaModel, batch_prompts: list[list[int]], use_kv_cache: bool
+) -> None:
+    shapes: list[tuple[int, int]] = []
+    hook = model.register_forward_pre_hook(lambda module, args: shapes.append(args[0].shape))
+    list(generator.generate_batch(batch_prompts, [GREEDY] * len(batch_prompts)))
+    hook.remove()
+    longest = max(len(prompt) for prompt in batch_prompts)
+    rows = len(batch_prompts)
+    if use_kv_cache:
+        assert shapes == [(rows, longest)] + [(rows, 1)] * (GREEDY.max_tokens - 1)
+    else:
+        assert shapes == [(rows, longest + step) for step in range(GREEDY.max_tokens)]
+
+
+def test_a_row_that_fills_the_context_ends_while_the_others_continue(
+    generator: TextGenerator, model: LlamaModel, prompt: list[int]
+) -> None:
+    # The finished row keeps running through the model, past the end of its context.
+    max_positions = model.config.max_position_embeddings
+    long_prompt = (prompt * max_positions)[: max_positions - 3]
+    batch = list(generator.generate_batch([long_prompt, prompt], [GREEDY, GREEDY]))
+    assert len(batch) == GREEDY.max_tokens
+    assert row_steps(batch, 0) == [
+        *generator.generate(long_prompt, GREEDY),
+        *[None] * (GREEDY.max_tokens - 3),
+    ]
+    assert row_steps(batch, 1) == list(generator.generate(prompt, GREEDY))
+
+
+def test_invalid_batches_raise(generator: TextGenerator, prompt: list[int]) -> None:
+    with pytest.raises(ValueError, match="no prompts"):
+        next(generator.generate_batch([], []))
+    with pytest.raises(ValueError, match="2 prompts but 1 sampling settings"):
+        next(generator.generate_batch([prompt, prompt], [GREEDY]))
+    with pytest.raises(ValueError, match="prompt 1 has no tokens"):
+        next(generator.generate_batch([prompt, []], [GREEDY, GREEDY]))
