@@ -204,7 +204,10 @@ def test_metadata_maps_each_token_to_its_pool_slot_and_query_row() -> None:
     # Sequence 0 in row 2 adds two tokens after three cached ones; sequence 1 in row 0 starts
     # with one token.
     metadata = AttentionMetadata.build([2, 0], [3, 0], [2, 1], max_len=8)
+    # A step with more than one new token gathers its sequences' rows, in order.
+    assert metadata.cache_rows is not None
     assert metadata.cache_rows.tolist() == [2, 0]
+    assert metadata.num_attention_rows == 2
     assert metadata.slot_mapping.tolist() == [2 * 8 + 3, 2 * 8 + 4, 0]
     # Queries are padded to two per sequence: sequence 1's token goes to the third slot.
     assert metadata.query_slots.tolist() == [0, 1, 2]
@@ -222,10 +225,27 @@ def test_the_metadata_mask_hides_positions_after_each_query() -> None:
     assert metadata.mask[1, 0].int().tolist() == [[1, 0, 0, 0, 0], [1, 1, 0, 0, 0]]
 
 
+def test_a_decode_step_reads_the_pool_rows_in_place() -> None:
+    # Sequence 0 in row 2 decodes its fourth token and sequence 1 in row 0 its second; row 1
+    # holds no sequence of this step.
+    metadata = AttentionMetadata.build([2, 0], [3, 1], [1, 1], max_len=8)
+    assert metadata.cache_rows is None
+    assert metadata.num_attention_rows == 3
+    assert metadata.slot_mapping.tolist() == [2 * 8 + 3, 1]
+    # Each query goes to its sequence's pool row.
+    assert metadata.query_slots.tolist() == [2, 0]
+    assert metadata.mask.shape == (3, 1, 1, 4)
+    assert metadata.mask[0, 0].int().tolist() == [[1, 1, 0, 0]]
+    # The unused query of row 1 sees key 0 only, whatever the row holds after it.
+    assert metadata.mask[1, 0].int().tolist() == [[1, 0, 0, 0]]
+    assert metadata.mask[2, 0].int().tolist() == [[1, 1, 1, 1]]
+
+
 @pytest.mark.parametrize(
     ("rows", "num_cached", "num_new", "message"),
     [
         ([], [], [], "at least one sequence"),
+        ([1, 1], [0, 0], [1, 1], "two sequences share a pool row"),
         ([0, 1], [0], [1, 1], "got 2 rows, 1 cached counts and 2 new counts"),
         ([0], [2], [0], "sequence 0 must add at least one token"),
         ([0], [-1], [1], "sequence 0 must add at least one token"),

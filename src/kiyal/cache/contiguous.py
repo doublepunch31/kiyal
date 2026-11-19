@@ -195,3 +195,17 @@ class ContiguousKVPool:
         keys = self._data[layer, 0, rows, :length]  # [B, L, Hkv, D]
         values = self._data[layer, 1, rows, :length]  # [B, L, Hkv, D]
         return keys.transpose(1, 2), values.transpose(1, 2)  # [B, Hkv, L, D] each
+
+    def view(self, layer: int, num_rows: int, length: int) -> tuple[Tensor, Tensor]:
+        """Returns one layer's keys and values at the first `length` positions of the first
+        `num_rows` rows, without copying.
+
+        Like `read`, positions past a row's own tokens must be masked out, and so must rows
+        that hold no sequence of the batch.
+
+        Returns:
+            Keys and values, each [num_rows, Hkv, length, D], views into the pool.
+        """
+        keys = self._data[layer, 0, :num_rows, :length]  # [R, L, Hkv, D]
+        values = self._data[layer, 1, :num_rows, :length]  # [R, L, Hkv, D]
+        return keys.transpose(1, 2), values.transpose(1, 2)  # [R, Hkv, L, D] each

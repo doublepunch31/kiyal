@@ -199,6 +199,21 @@ def test_reading_copies_the_rows(pool: ContiguousKVPool, tiny_config: ModelConfi
     assert not keys.any()
 
 
+def test_viewing_returns_the_first_rows_without_copying(
+    pool: ContiguousKVPool, tiny_config: ModelConfig
+) -> None:
+    keys, values = pool.view(0, 2, 3)
+    assert (
+        keys.shape == values.shape == (2, tiny_config.num_key_value_heads, 3, tiny_config.head_dim)
+    )
+    new_keys, new_values = random_token_kv(tiny_config, 1, seed=0)
+    pool.write(0, torch.tensor(slots(1, range(2, 3))), new_keys, new_values)
+    # The views show the write, and match what a copying read returns.
+    torch.testing.assert_close(keys[1, :, 2], new_keys[0])
+    torch.testing.assert_close(values[1, :, 2], new_values[0])
+    torch.testing.assert_close(keys, pool.read(0, torch.tensor([0, 1]), 3)[0])
+
+
 def test_a_pool_write_of_the_wrong_size_raises_instead_of_broadcasting(
     pool: ContiguousKVPool, tiny_config: ModelConfig
 ) -> None:

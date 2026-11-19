@@ -21,21 +21,32 @@ class AttentionMetadata:
     that (decode), or a part of the prompt after a cached prefix. Built once per step and
     shared by every layer.
 
-    Attention needs a [sequences, tokens] layout, so each layer scatters the queries into
-    B rows of Q, the most new tokens of any sequence, and reads B rows of L keys from the
+    Attention needs a [rows, tokens] layout, so each layer scatters the queries into A rows
+    of Q, the most new tokens of any sequence, and attends over A rows of L keys from the
     pool, L being the longest sequence after this step. Shorter sequences are padded, and
     the causal mask hides the key positions past each query's own.
 
+    The A attention rows are one of two things:
+    - In decode steps (Q = 1), the pool rows 0 to A - 1, read in place without copying,
+      A - 1 being the highest row of the step. A sequence's queries go to its own pool row.
+      Rows without a sequence of the step get an unused query each, which costs little,
+      while copying the rows out of the pool would cost more than attention itself.
+    - In other steps, the B rows of the step's sequences, gathered from the pool in their
+      order (A = B). With long queries, every extra row would cost Q queries.
+
     Attributes:
-        cache_rows: [B] pool row of each sequence.
+        cache_rows: [B] pool row of each sequence to gather, or None when the pool rows are
+            read in place.
+        num_attention_rows: A.
         slot_mapping: [N] pool slot of each new token, `row * max_len + position`.
-        query_slots: [N] index of each new token in the padded [B * Q] query layout.
-        mask: [B, 1, Q, L] True where a query may attend to a key. Broadcasts over heads.
+        query_slots: [N] index of each new token in the padded [A * Q] query layout.
+        mask: [A, 1, Q, L] True where a query may attend to a key. Broadcasts over heads.
         max_query_len: Q.
         max_seq_len: L.
     """
 
-    cache_rows: Tensor
+    cache_rows: Tensor | None
+    num_attention_rows: int
     slot_mapping: Tensor
     query_slots: Tensor
     mask: Tensor
@@ -61,8 +72,8 @@ class AttentionMetadata:
             device: Device of the tensors.
 
         Raises:
-            ValueError: If there are no sequences, the lists differ in length, a sequence
-                adds no tokens, or a sequence would not fit its row.
+            ValueError: If there are no sequences, the lists differ in length, two sequences
+                share a row, a sequence adds no tokens, or a sequence would not fit its row.
         """
         if not cache_rows:
             raise ValueError("a step needs at least one sequence")
@@ -71,6 +82,8 @@ class AttentionMetadata:
                 f"got {len(cache_rows)} rows, {len(num_cached)} cached counts and "
                 f"{len(num_new)} new counts"
             )
+        if len(set(cache_rows)) != len(cache_rows):
+            raise ValueError(f"two sequences share a pool row: {list(cache_rows)}")
         seq_lens = [cached + new for cached, new in zip(num_cached, num_new, strict=True)]
         for index, (cached, new) in enumerate(zip(num_cached, num_new, strict=True)):
             if cached < 0 or new < 1:
@@ -90,24 +103,36 @@ class AttentionMetadata:
             for row, cached, length in zip(cache_rows, num_cached, seq_lens, strict=True)
             for position in range(cached, length)
         ]
+        in_place = max_query_len == 1
+        if in_place:
+            attention_rows = list(cache_rows)
+            num_attention_rows = max(cache_rows) + 1
+        else:
+            attention_rows = list(range(len(cache_rows)))
+            num_attention_rows = len(cache_rows)
         query_slots = [
-            index * max_query_len + offset
-            for index, new in enumerate(num_new)
+            row * max_query_len + offset
+            for row, new in zip(attention_rows, num_new, strict=True)
             for offset in range(new)
         ]
+        # A row without a sequence counts as holding nothing, so its query sees key 0 only.
+        row_cached = [0] * num_attention_rows
+        for row, cached in zip(attention_rows, num_cached, strict=True):
+            row_cached[row] = cached
 
-        # Query i of sequence b sits at position num_cached[b] + i and sees the keys up to
-        # its own position. Causality alone keeps it inside its sequence: every later
-        # position in the row is padding or was left by a sequence that held the row before.
-        # A padded query (i >= num_new[b]) sees more than its sequence, but never nothing,
-        # so its softmax stays finite, and its result is thrown away.
-        query_positions = torch.tensor(num_cached, device=device).unsqueeze(-1) + torch.arange(
+        # Query i of a row sits at position row_cached + i and sees the keys up to its own
+        # position. Causality alone keeps it inside its sequence: every later position in
+        # the row is padding or was left by a sequence that held the row before. A padded
+        # query (i >= num_new[b]) sees more than its sequence, but never nothing, so its
+        # softmax stays finite, and its result is thrown away.
+        query_positions = torch.tensor(row_cached, device=device).unsqueeze(-1) + torch.arange(
             max_query_len, device=device
-        )  # [B, Q]
+        )  # [A, Q]
         key_positions = torch.arange(max_seq_len, device=device)  # [L]
-        mask = key_positions <= query_positions.unsqueeze(-1)  # [B, Q, L]
+        mask = key_positions <= query_positions.unsqueeze(-1)  # [A, Q, L]
         return cls(
-            cache_rows=torch.tensor(cache_rows, device=device),
+            cache_rows=None if in_place else torch.tensor(cache_rows, device=device),
+            num_attention_rows=num_attention_rows,
             slot_mapping=torch.tensor(slot_mapping, device=device),
             query_slots=torch.tensor(query_slots, device=device),
             mask=mask.unsqueeze(1),
@@ -238,19 +263,21 @@ class Attention(nn.Module):
         q = apply_rotary_embedding(q, cos, sin)  # [N, H, D]
         k = apply_rotary_embedding(k, cos, sin)  # [N, Hkv, D]
         pool.write(self.layer_index, metadata.slot_mapping, k, v)
-        keys, values = pool.read(
-            self.layer_index, metadata.cache_rows, metadata.max_seq_len
-        )  # [B, Hkv, L, D] each
+        num_rows = metadata.num_attention_rows
+        if metadata.cache_rows is None:
+            keys, values = pool.view(self.layer_index, num_rows, metadata.max_seq_len)
+        else:
+            keys, values = pool.read(self.layer_index, metadata.cache_rows, metadata.max_seq_len)
+        # keys, values: [A, Hkv, L, D] each
 
-        num_seqs = keys.shape[0]
         num_queries = metadata.max_query_len
-        padded = q.new_zeros(num_seqs * num_queries, self.num_heads, self.head_dim)
-        padded.index_copy_(0, metadata.query_slots, q)  # [B*Q, H, D]
-        padded = padded.view(num_seqs, num_queries, self.num_heads, self.head_dim)
+        padded = q.new_zeros(num_rows * num_queries, self.num_heads, self.head_dim)
+        padded.index_copy_(0, metadata.query_slots, q)  # [A*Q, H, D]
+        padded = padded.view(num_rows, num_queries, self.num_heads, self.head_dim)
         out = scaled_dot_product_attention(
             padded.transpose(1, 2), keys, values, attn_mask=metadata.mask, enable_gqa=True
-        )  # [B, H, Q, D]
-        out = out.transpose(1, 2).reshape(num_seqs * num_queries, -1)  # [B*Q, H*D]
+        )  # [A, H, Q, D]
+        out = out.transpose(1, 2).reshape(num_rows * num_queries, -1)  # [A*Q, H*D]
         return self.o_proj(out[metadata.query_slots])  # [N, hidden]
 
 

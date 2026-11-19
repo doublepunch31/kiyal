@@ -361,12 +361,20 @@ def test_a_reused_row_ignores_what_its_previous_sequence_left(model: LlamaModel)
     used = ContiguousKVPool(model.config, 2, POOL_LEN)
     # A longer sequence held row 0 before and ended; its keys and values stay behind.
     flat_step(model, used, [(0, other, 0)])
-    pieces = [(0, short, 0), (1, long, 0)]
-    for expected, actual in zip(
-        flat_step(model, fresh, pieces), flat_step(model, used, pieces), strict=True
-    ):
-        # Stale positions get a weight of exactly 0, so the logits are unchanged to the bit.
-        assert torch.equal(actual, expected)
+    # A prefill, which gathers the rows, then a decode, which reads them in place up to the
+    # longer sequence, past the shorter one's end into what the old sequence left.
+    steps = [
+        [(0, short[:-1], 0), (1, long[:-1], 0)],
+        [(0, short[-1:], len(short) - 1), (1, long[-1:], len(long) - 1)],
+    ]
+    assert len(other) > len(short)
+    for pieces in steps:
+        for expected, actual in zip(
+            flat_step(model, fresh, pieces), flat_step(model, used, pieces), strict=True
+        ):
+            # Stale positions get a weight of exactly 0, so the logits are unchanged to the
+            # bit.
+            assert torch.equal(actual, expected)
 
 
 @torch.inference_mode()
