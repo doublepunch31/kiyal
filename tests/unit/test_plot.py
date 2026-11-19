@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 
 import pytest
+from matplotlib.figure import Figure
+from matplotlib.text import Annotation
 
 from benchmarks import plot
 
@@ -225,3 +227,110 @@ def test_main_writes_the_throughput_chart_and_table(
     expected = f"{plot.describe({'static': batches})}\n\n{plot.throughput_table(batches)}"
     assert table.read_text() == expected
     assert capsys.readouterr().out == f"saved {chart}\nsaved {table}\n"
+
+
+def batching_result(speeds: dict[int, tuple[float, float]]) -> plot.Result:
+    """A batching result in the shape that benchmarks.batching saves.
+
+    Args:
+        speeds: Static and continuous output tokens/s per batch size. Latencies are derived
+            from them so that each value is distinct.
+    """
+
+    def summary(speed: float) -> dict[str, float]:
+        return {
+            "output_tokens_per_s": speed,
+            "e2e_p50_s": 1000 / speed,
+            "e2e_p99_s": 2000 / speed,
+            "ttft_p50_s": 500 / speed,
+        }
+
+    return {
+        "benchmark": "batching",
+        "model": "org/tiny-model",
+        "revision": None,
+        "num_requests": 64,
+        "prompt_tokens": [32, 256],
+        "output_tokens": [16, 256],
+        "seed": 0,
+        "max_num_batched_tokens": 2048,
+        "repeats": 3,
+        "warmup": 1,
+        "environment": {"device": "cpu", "dtype": "float32", "cpu": "Test CPU", "torch": "2.15.0"},
+        "results": [
+            {
+                "batch_size": size,
+                "static_decode_utilization": 0.5,
+                "engines": {
+                    "static": {"median": summary(static)},
+                    "continuous": {"median": summary(continuous)},
+                },
+            }
+            for size, (static, continuous) in speeds.items()
+        ],
+    }
+
+
+@pytest.fixture
+def engines() -> plot.Result:
+    return batching_result({8: (100.0, 125.0), 16: (200.0, 250.0)})
+
+
+def test_a_batching_result_is_loaded(tmp_path: Path, engines: plot.Result) -> None:
+    assert plot.load_batching_result(write(tmp_path / "b.json", engines)) == engines
+    with pytest.raises(ValueError, match="not a batching result"):
+        plot.load_batching_result(write(tmp_path / "t.json", throughput_result({1: (1, 1, 1)})))
+
+
+def test_the_batching_description_names_the_workload(engines: plot.Result) -> None:
+    assert plot.describe_batching(engines) == (
+        "tiny-model, cpu float32, Test CPU, 64 requests at once, prompts 32-256 and outputs "
+        "16-256 tokens, greedy, median of 3 runs"
+    )
+
+
+def test_the_batching_table_compares_the_engines_at_each_batch_size(
+    engines: plot.Result,
+) -> None:
+    lines = plot.batching_table(engines).splitlines()
+    assert lines[0] == (
+        "| batch size | static tokens/s | continuous tokens/s | static p50 E2E s | "
+        "continuous p50 E2E s | static p99 E2E s | continuous p99 E2E s | static p50 TTFT s | "
+        "continuous p50 TTFT s | throughput x | static decode use |"
+    )
+    assert lines[2:] == [
+        "| 8 | 100.0 | 125.0 | 10.00 | 8.00 | 20.00 | 16.00 | 5.00 | 4.00 | 1.25 | 50% |",
+        "| 16 | 200.0 | 250.0 | 5.00 | 4.00 | 10.00 | 8.00 | 2.50 | 2.00 | 1.25 | 50% |",
+    ]
+
+
+def test_main_writes_the_batching_chart_and_table(
+    tmp_path: Path, engines: plot.Result, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "batching-cpu"
+    path = write(tmp_path / "b.json", engines)
+    assert plot.main(["batching", str(path), "--output", str(output)]) == 0
+    chart, table = output.with_name("batching-cpu.png"), output.with_name("batching-cpu.md")
+    assert chart.read_bytes().startswith(PNG_SIGNATURE)
+    assert (
+        table.read_text() == f"{plot.describe_batching(engines)}\n\n{plot.batching_table(engines)}"
+    )
+    assert capsys.readouterr().out == f"saved {chart}\nsaved {table}\n"
+
+
+def test_end_labels_that_would_overlap_are_moved_apart() -> None:
+    figure = Figure(dpi=100)
+    axes = figure.subplots()
+    axes.set_ylim(0, 100)
+    # Two line ends 1 unit apart, a few points on screen, and one far away.
+    plot._spread_end_labels(axes, [(1, 20.0, "a"), (1, 21.0, "b"), (1, 80.0, "c")])
+    to_points = 72 / figure.dpi
+    annotations = [text for text in axes.texts if isinstance(text, Annotation)]
+    assert len(annotations) == 3
+    heights = {
+        a.get_text(): axes.transData.transform(a.xy)[1] * to_points + a.xyann[1]
+        for a in annotations
+    }
+    assert heights["b"] - heights["a"] >= 12
+    # A label with room stays next to its line end.
+    assert heights["c"] == pytest.approx(axes.transData.transform((1, 80.0))[1] * to_points, abs=8)

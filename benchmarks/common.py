@@ -32,6 +32,20 @@ def median(values: Sequence[float]) -> float:
     return float(statistics.median(values))
 
 
+def percentile(values: Sequence[float], percent: int) -> float:
+    """Returns the value below which `percent` percent of the values lie.
+
+    Interpolates linearly between the two nearest values, like NumPy's default, so the 50th
+    percentile is the median.
+
+    Raises:
+        ValueError: If `percent` is outside [1, 99] or there are fewer than 2 values.
+    """
+    if not 1 <= percent <= 99:
+        raise ValueError(f"percent must be in [1, 99], got {percent}")
+    return statistics.quantiles(values, n=100, method="inclusive")[percent - 1]
+
+
 def capture_environment(device: torch.device, dtype: torch.dtype) -> dict[str, object]:
     """Describes the machine and software a result was measured on."""
     environment: dict[str, object] = {

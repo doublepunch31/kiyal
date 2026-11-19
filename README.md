@@ -19,13 +19,18 @@ Early development. Implemented so far:
 - static batching: prompts of different lengths are padded at the start into one batch, with the
   padding hidden from attention and positions counted per row, so each prompt gets the tokens it
   would get alone
+- continuous batching: an engine with `add_request` and `step` whose scheduler rebuilds the batch
+  at every step, first come, first served, within limits on sequences and tokens per step. A
+  request leaves the batch as soon as its output ends and a waiting one takes its place. The
+  tokens of all requests in a step run through the model flattened, without padding, and each
+  request keeps its keys and values in its own row of a preallocated pool
 - `kiyal generate`, which streams text decoded with the KV cache. The loop that recomputes the
   whole sequence at every step is kept as the baseline for tests and benchmarks.
 
 On SmolLM2-135M-Instruct in fp32 on CPU, the model's logits match `transformers` within 1e-4, and
 greedy generation for a chat prompt gives the same tokens as `transformers`' `generate()`. Decoding
-with the KV cache gives the same tokens as decoding without it, and a batch gives each prompt the
-same tokens as decoding it alone. Continuous batching and the server are not implemented yet.
+with the KV cache gives the same tokens as decoding without it, and a static or continuous batch
+gives each prompt the same tokens as decoding it alone. The server is not implemented yet.
 
 ## Setup
 
@@ -61,8 +66,8 @@ uv run kiyal generate --model HuggingFaceTB/SmolLM2-135M-Instruct \
 
 ## Benchmarks
 
-All numbers below were measured on a laptop (Apple M4, on battery power). None are NVIDIA GPU
-numbers.
+All numbers below were measured on a laptop (Apple M4): the KV cache and static batching runs
+on battery power, the continuous batching runs on AC power. None are NVIDIA GPU numbers.
 
 ### KV cache
 
@@ -130,7 +135,51 @@ Accelerate backend on this machine, multiplying 2 to 16 rows by a weight stored 
 took about 200 µs for a 1536 x 576 weight, against 8 µs for one row and 20 µs for the same rows
 with the weight stored transposed. From batch 2 on, the step time grows slowly again.
 
-The result files, the CPU chart and the full tables are in
+### Continuous batching
+
+64 requests arrive at once, with prompt lengths drawn from 32 to 256 tokens and output lengths
+from 16 to 256 (seed 0), decoded greedily. Static batching takes them in arrival order, B at a
+time, and runs each batch until its longest output ends. Continuous batching keeps up to B
+requests in the batch and starts a waiting one as soon as another ends. Latency counts from
+arrival to a request's last token. Median of 3 runs after one warm-up per engine and batch size.
+
+On the M4 GPU through MPS (fp16):
+
+![Throughput and request latency of static and continuous batching on the M4 GPU](benchmarks/results/batching-mps.png)
+
+| batch size | static tokens/s | continuous tokens/s | throughput x | static p50 s | continuous p50 s | static p99 s | continuous p99 s | static decode use |
+|---|---|---|---|---|---|---|---|---|
+| 8 | 254.0 | 371.3 | 1.46 | 20.5 | 15.5 | 38.8 | 26.4 | 67% |
+| 16 | 362.4 | 530.5 | 1.46 | 13.7 | 11.6 | 26.8 | 18.5 | 62% |
+| 32 | 516.0 | 709.2 | 1.37 | 10.9 | 9.0 | 19.0 | 13.8 | 61% |
+
+With these output lengths, only 61% to 67% of static batching's decoding slots go to outputs
+that have not ended ("decode use"); the rest compute tokens of finished outputs that are thrown
+away, and requests in later batches wait for the whole batch before them. Continuous batching
+gives 1.37 to 1.46 times the throughput, with a 27% to 32% lower p99 latency and a 16% to 24%
+lower median. The gain stays below the 1.5 to 1.6 that the unused slots alone would allow: a
+step that starts new prompts pauses every running output, and the last steps run with a
+part-empty batch. Four further runs alternating the two engines at batch 16 gave 1.32 to 1.43.
+
+On the CPU (fp32, 4 threads):
+
+| batch size | static tokens/s | continuous tokens/s | throughput x | static p50 s | continuous p50 s | static p99 s | continuous p99 s |
+|---|---|---|---|---|---|---|---|
+| 8 | 92.5 | 117.3 | 1.27 | 54.2 | 47.8 | 106.4 | 83.9 |
+| 16 | 175.0 | 210.5 | 1.20 | 29.6 | 30.2 | 55.1 | 46.8 |
+| 32 | 269.4 | 308.3 | 1.14 | 20.5 | 18.8 | 36.4 | 31.9 |
+
+CPU timings are noisier: static batching at batch 8 ran 25% slower than in an earlier session
+with the same code, and four runs alternating the engines at batch 16 gave ratios from 1.31 to
+1.61. Every timed continuous batching run was faster than every static batching run, on both
+devices.
+
+The first version of this benchmark made continuous batching slower than static batching. A
+profile showed that each decode step spent more time copying the batch's KV cache rows out of
+the pool than in attention itself (32 ms against 4 ms per step on MPS at batch 32). Decode steps
+now read the rows in place.
+
+The result files, the CPU charts and the full tables are in
 [benchmarks/results/](benchmarks/results/).
 
 ## Development
@@ -151,7 +200,9 @@ the first step: at every decoding step the cached logits must match the uncached
 tolerance, and greedy generation must give the same tokens. Steps where the two best tokens are
 closer than twice the tolerance are near ties that rounding can flip, so the token comparison
 stops at the first one. Static batching is the second: each row of a padded batch must match its
-prompt decoded alone with the KV cache, in the same way.
+prompt decoded alone with the KV cache, in the same way. Continuous batching is the third: with
+requests arriving at random steps and in random order, each must again match its prompt decoded
+alone.
 
 ```sh
 # Single-request decoding speed at several output lengths, saved as JSON in benchmarks/raw/.
@@ -167,6 +218,11 @@ uv run python -m benchmarks.plot latency benchmarks/results/latency-*-cpu.json \
 uv run python -m benchmarks.throughput --model HuggingFaceTB/SmolLM2-135M-Instruct --device cpu
 uv run python -m benchmarks.plot throughput benchmarks/results/throughput-static-cpu.json \
     --output benchmarks/results/throughput-cpu
+
+# Static against continuous batching on 64 requests of random lengths, then the chart and table.
+uv run python -m benchmarks.batching --model HuggingFaceTB/SmolLM2-135M-Instruct --device cpu
+uv run python -m benchmarks.plot batching benchmarks/results/batching-cpu.json \
+    --output benchmarks/results/batching-cpu
 ```
 
 ## License

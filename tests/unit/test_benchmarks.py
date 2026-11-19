@@ -5,9 +5,11 @@ from pathlib import Path
 import pytest
 import torch
 
-from benchmarks import latency, throughput
-from benchmarks.common import REPO_ROOT, capture_environment, median, save_result
+from benchmarks import batching, latency, throughput
+from benchmarks.common import REPO_ROOT, capture_environment, median, percentile, save_result
+from kiyal.config import EngineConfig
 from kiyal.engine.generator import TextGenerator
+from kiyal.engine.llm_engine import LLMEngine
 from kiyal.model.llama import LlamaModel
 from kiyal.model.loader import load_model
 from kiyal.tokenizer import Tokenizer
@@ -38,6 +40,15 @@ def test_environment_names_the_code_and_the_machine() -> None:
 
 def test_median_is_the_middle_run() -> None:
     assert median([3.0, 1.0, 10.0]) == 3.0
+
+
+def test_percentiles_interpolate_between_values() -> None:
+    values = [float(v) for v in range(1, 102)]  # 1 to 101
+    assert percentile(values, 50) == median(values) == 51.0
+    assert percentile(values, 99) == pytest.approx(100.0)
+    assert percentile([1.0, 3.0], 50) == 2.0
+    with pytest.raises(ValueError, match=r"percent must be in \[1, 99\]"):
+        percentile(values, 100)
 
 
 def test_save_result_writes_json_in_a_new_directory(tmp_path: Path) -> None:
@@ -253,3 +264,141 @@ def test_the_default_throughput_run_covers_batch_sizes_1_to_64(
             warmup=1,
         )
     ]
+
+
+@pytest.fixture(scope="module")
+def tiny_model(tiny_model_dir: Path) -> LlamaModel:
+    return load_model(tiny_model_dir, device=CPU, dtype=torch.float32)
+
+
+@pytest.fixture(scope="module")
+def workload(tiny_tokenizer: Tokenizer) -> batching.Workload:
+    return batching.build_workload(tiny_tokenizer, 5, (4, 12), (2, 9), seed=0)
+
+
+def test_the_workload_draws_lengths_from_the_ranges(tiny_tokenizer: Tokenizer) -> None:
+    workload = batching.build_workload(tiny_tokenizer, 50, (4, 12), (2, 9), seed=0)
+    assert all(4 <= len(prompt) <= 12 for prompt in workload.prompts)
+    assert all(2 <= n <= 9 for n in workload.output_tokens)
+    # Both ends of each range occur, so the ranges include their ends.
+    assert {len(prompt) for prompt in workload.prompts} >= {4, 12}
+    assert set(workload.output_tokens) >= {2, 9}
+    assert len({tuple(prompt) for prompt in workload.prompts}) == 50
+    assert workload == batching.build_workload(tiny_tokenizer, 50, (4, 12), (2, 9), seed=0)
+    assert workload != batching.build_workload(tiny_tokenizer, 50, (4, 12), (2, 9), seed=1)
+
+
+def test_the_workload_asks_for_exactly_its_output_lengths(workload: batching.Workload) -> None:
+    params = workload.params
+    assert [p.max_tokens for p in params] == workload.output_tokens
+    assert all(p.temperature == 0 and p.ignore_eos for p in params)
+    assert workload.max_len == max(
+        len(prompt) + n for prompt, n in zip(workload.prompts, workload.output_tokens, strict=True)
+    )
+
+
+def test_static_decode_use_counts_the_steps_of_ended_outputs() -> None:
+    workload = batching.Workload(prompts=[[1]] * 5, output_tokens=[2, 4, 1, 1, 3])
+    # Batches [2, 4] and [1, 1] run 4 and 1 steps per row; [3] runs alone.
+    assert batching.static_decode_utilization(workload, 2) == pytest.approx(11 / 13)
+    assert batching.static_decode_utilization(workload, 1) == 1.0
+
+
+def test_run_timing_summarizes_throughput_and_latency() -> None:
+    timing = batching.RunTiming(
+        total_s=4.0, ttft_s=[0.5, 1.0, 1.5], e2e_s=[2.0, 3.0, 4.0], output_tokens=20
+    )
+    assert timing.output_tokens_per_s == 5.0
+    assert timing.requests_per_s == 0.75
+    summary = timing.summary()
+    assert (summary["ttft_p50_s"], summary["e2e_p50_s"]) == (1.0, 3.0)
+    assert summary["e2e_p99_s"] == pytest.approx(3.98)
+
+
+def check_timing(timing: batching.RunTiming, workload: batching.Workload) -> None:
+    assert timing.output_tokens == sum(workload.output_tokens)
+    assert len(timing.ttft_s) == len(timing.e2e_s) == len(workload.prompts)
+    for first, last in zip(timing.ttft_s, timing.e2e_s, strict=True):
+        assert 0 < first <= last <= timing.total_s
+
+
+def test_static_batching_runs_every_request_to_its_length(
+    tiny_model: LlamaModel, tiny_tokenizer: Tokenizer, workload: batching.Workload
+) -> None:
+    timing = batching.time_static(TextGenerator(tiny_model, tiny_tokenizer), workload, 2, CPU)
+    check_timing(timing, workload)
+    # The third batch starts after the first two have ended.
+    assert timing.ttft_s[4] >= max(timing.e2e_s[:4])
+
+
+def test_continuous_batching_runs_every_request_to_its_length(
+    tiny_model: LlamaModel, tiny_tokenizer: Tokenizer, workload: batching.Workload
+) -> None:
+    engine = LLMEngine(tiny_model, tiny_tokenizer, EngineConfig(max_num_seqs=2))
+    check_timing(batching.time_continuous(engine, workload, CPU), workload)
+    assert not engine.has_unfinished()
+
+
+def test_batching_measures_both_engines_at_each_batch_size(
+    tiny_model: LlamaModel, tiny_tokenizer: Tokenizer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, int]] = []
+    time_static, time_continuous = batching.time_static, batching.time_continuous
+
+    def recording_static(generator, workload, batch_size, device):
+        calls.append(("static", batch_size))
+        return time_static(generator, workload, batch_size, device)
+
+    def recording_continuous(engine, workload, device):
+        calls.append(("continuous", engine._scheduler._config.max_num_seqs))
+        return time_continuous(engine, workload, device)
+
+    monkeypatch.setattr(batching, "time_static", recording_static)
+    monkeypatch.setattr(batching, "time_continuous", recording_continuous)
+    settings = batching.Settings(
+        num_requests=4,
+        prompt_tokens=(4, 8),
+        output_tokens=(2, 6),
+        seed=0,
+        batch_sizes=(1, 3),
+        max_num_batched_tokens=32,
+        repeats=2,
+        warmup=1,
+    )
+    results = batching.measure(tiny_model, tiny_tokenizer, settings, CPU)
+    assert (
+        calls
+        == [("static", 1)] * 3
+        + [("continuous", 1)] * 3
+        + [("static", 3)] * 3
+        + [("continuous", 3)] * 3
+    )
+    assert [entry["batch_size"] for entry in results] == [1, 3]
+    for entry in results:
+        engines = entry["engines"]
+        assert isinstance(engines, dict)
+        assert list(engines) == ["static", "continuous"]
+        for summary in engines.values():
+            assert len(summary["runs"]) == 2
+            assert summary["median"]["total_s"] == median([r["total_s"] for r in summary["runs"]])
+    assert results[0]["static_decode_utilization"] == 1.0
+
+
+def test_batching_main_saves_a_result_file(
+    tiny_model_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "batching.json"
+    options = ["--device", "cpu", "--dtype", "fp32", "--num-requests", "4", "--repeats", "1"]
+    lengths = ["--prompt-tokens", "4", "8", "--output-tokens", "2", "6", "--warmup", "0"]
+    args = ["--model", str(tiny_model_dir), *options, *lengths, "--batch-sizes", "2"]
+    assert batching.main([*args, "--output", str(output)]) == 0
+
+    result = json.loads(output.read_text())
+    assert result["benchmark"] == "batching"
+    assert (result["prompt_tokens"], result["output_tokens"]) == ([4, 8], [2, 6])
+    assert (result["num_requests"], result["seed"], result["repeats"]) == (4, 0, 1)
+    assert result["max_num_batched_tokens"] == EngineConfig().max_num_batched_tokens
+    assert [entry["batch_size"] for entry in result["results"]] == [2]
+    printed = capsys.readouterr().out
+    assert "continuous" in printed
+    assert f"saved {output}" in printed

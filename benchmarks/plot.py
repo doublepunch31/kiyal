@@ -1,12 +1,14 @@
 """Renders benchmark results as a chart (PNG) and a table (markdown).
 
-Run from the repository root, with the latency results of both engines or one throughput
-result:
+Run from the repository root, with the latency results of both engines, one throughput
+result or one batching result:
 
     uv run python -m benchmarks.plot latency benchmarks/results/latency-*-cpu.json \
         --output benchmarks/results/latency-cpu
     uv run python -m benchmarks.plot throughput benchmarks/results/throughput-static-cpu.json \
         --output benchmarks/results/throughput-cpu
+    uv run python -m benchmarks.plot batching benchmarks/results/batching-cpu.json \
+        --output benchmarks/results/batching-cpu
 """
 
 import argparse
@@ -18,13 +20,17 @@ from typing import Any
 
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 from matplotlib.ticker import FuncFormatter, NullLocator
 
 # Engines in the order they are drawn and listed. Each keeps its color in every chart.
 ENGINE_COLORS = {"cached": "#2a78d6", "naive": "#eb6834"}
 ENGINE_LABELS = {"cached": "KV cache", "naive": "naive (no cache)"}
-# Static batching decodes with the KV cache, so it keeps the cache's color.
+# Static batching decodes with the KV cache, so it keeps the cache's color. Continuous
+# batching takes the next free hue, so no two engines share a color in any chart.
 STATIC_COLOR = ENGINE_COLORS["cached"]
+BATCHING_COLORS = {"static": STATIC_COLOR, "continuous": "#1baf7a"}
+BATCHING_LABELS = {"static": "static batching", "continuous": "continuous batching"}
 SURFACE = "#fcfcfb"
 TEXT = "#0b0b0b"
 MUTED_TEXT = "#52514e"
@@ -271,11 +277,138 @@ def plot_throughput(result: Result, path: Path) -> Path:
     return path
 
 
+def load_batching_result(path: Path) -> Result:
+    """Reads a batching result file.
+
+    Raises:
+        ValueError: If the file is not a batching result.
+    """
+    result = json.loads(path.read_text())
+    if result.get("benchmark") != "batching":
+        raise ValueError(f"{path} is not a batching result")
+    return result
+
+
+def engine_medians(result: Result, engine: str, metric: str) -> dict[int, float]:
+    """Returns the median of a metric for each batch size of one engine in a batching result."""
+    return {
+        entry["batch_size"]: entry["engines"][engine]["median"][metric]
+        for entry in result["results"]
+    }
+
+
+def describe_batching(result: Result) -> str:
+    """Returns one line naming the model, the machine and the workload of a batching run."""
+    environment = result["environment"]
+    model = str(result["model"]).rsplit("/", 1)[-1]
+    hardware = environment.get("gpu") or environment["cpu"]
+    repeats = result["repeats"]
+    runs = "1 run" if repeats == 1 else f"median of {repeats} runs"
+    (prompt_min, prompt_max), (output_min, output_max) = (
+        result["prompt_tokens"],
+        result["output_tokens"],
+    )
+    return (
+        f"{model}, {environment['device']} {environment['dtype']}, {hardware}, "
+        f"{result['num_requests']} requests at once, prompts {prompt_min}-{prompt_max} and "
+        f"outputs {output_min}-{output_max} tokens, greedy, {runs}"
+    )
+
+
+def batching_table(result: Result) -> str:
+    """Renders a batching result as a markdown table with one row per batch size.
+
+    "decode use" is the share of static batching's decoding slots that go to outputs that
+    have not ended; continuous batching uses all of them.
+    """
+    header = ["batch size"]
+    for metric in ("tokens/s", "p50 E2E s", "p99 E2E s", "p50 TTFT s"):
+        header += [f"static {metric}", f"continuous {metric}"]
+    header += ["throughput x", "static decode use"]
+    lines = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
+    metrics = [
+        ("output_tokens_per_s", ".1f"),
+        ("e2e_p50_s", ".2f"),
+        ("e2e_p99_s", ".2f"),
+        ("ttft_p50_s", ".2f"),
+    ]
+    for entry in sorted(result["results"], key=lambda e: e["batch_size"]):
+        engines = entry["engines"]
+        row = [str(entry["batch_size"])]
+        for metric, spec in metrics:
+            row += [format(engines[engine]["median"][metric], spec) for engine in BATCHING_COLORS]
+        speeds = [engines[engine]["median"]["output_tokens_per_s"] for engine in BATCHING_COLORS]
+        row += [f"{speeds[1] / speeds[0]:.2f}", f"{entry['static_decode_utilization']:.0%}"]
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def plot_batching(result: Result, path: Path) -> Path:
+    """Draws throughput and request latency against batch size, one color per engine.
+
+    Throughput and latency have different units, so each gets its own panel rather than a
+    second y-axis.
+    """
+    figure = Figure(figsize=(10.5, 4.6), dpi=160, facecolor=SURFACE)
+    speed_axes, latency_axes = figure.subplots(1, 2)
+    sizes = sorted(entry["batch_size"] for entry in result["results"])
+    end_labels: list[tuple[int, float, str]] = []
+
+    for engine, color in BATCHING_COLORS.items():
+        label = BATCHING_LABELS[engine]
+        speeds = engine_medians(result, engine, "output_tokens_per_s")
+        _draw_series(speed_axes, speeds, color, label, f"{speeds[sizes[-1]]:,.0f}")
+        p50 = engine_medians(result, engine, "e2e_p50_s")
+        p99 = engine_medians(result, engine, "e2e_p99_s")
+        # The median's end label is placed below, apart from the other engine's.
+        _draw_series(latency_axes, p50, color, f"{label}, median", None)
+        end_labels.append((sizes[-1], p50[sizes[-1]], f"{p50[sizes[-1]]:.1f} s"))
+        # The tail in the same color, told apart by dashes without markers.
+        tail = _draw_series(latency_axes, p99, color, f"{label}, p99", None)
+        tail.set_linestyle("--")
+        tail.set_marker("")
+
+    _style_axes(speed_axes, sizes, "Output tokens per second", "batch size")
+    speed_axes.set_ylim(bottom=0)
+    speed_axes.legend(frameon=False, labelcolor=TEXT, loc="upper left", fontsize=9)
+    _style_axes(
+        latency_axes, sizes, "Request latency in seconds (arrival to last token)", "batch size"
+    )
+    latency_axes.set_ylim(bottom=0)
+    _spread_end_labels(latency_axes, end_labels)
+    # Long handles, so that the dashes show in the legend.
+    latency_axes.legend(
+        frameon=False, labelcolor=TEXT, loc="upper right", fontsize=8, handlelength=3.5
+    )
+    # The gain in numbers at each end of the range.
+    if sizes:
+        static = engine_medians(result, "static", "output_tokens_per_s")
+        continuous = engine_medians(result, "continuous", "output_tokens_per_s")
+        gains = [
+            f"batch {size}: x{continuous[size] / static[size]:.2f}"
+            for size in (sizes[0], sizes[-1])
+        ]
+        speed_axes.text(
+            0.0, 1.03, "continuous over static, " + ", ".join(dict.fromkeys(gains)),
+            transform=speed_axes.transAxes, color=MUTED_TEXT, fontsize=9, va="bottom",
+        )  # fmt: skip
+
+    figure.suptitle(
+        "Static against continuous batching, outputs of different lengths",
+        x=0.06, y=0.97, ha="left", color=TEXT, fontsize=13, fontweight="bold",
+    )  # fmt: skip
+    figure.text(0.06, 0.885, describe_batching(result), color=MUTED_TEXT, fontsize=9)
+    figure.subplots_adjust(left=0.06, right=0.97, top=0.74, bottom=0.12, wspace=0.16)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path)
+    return path
+
+
 def _draw_series(
-    axes: Axes, values: dict[int, float], color: str, label: str, end_label: str
-) -> None:
+    axes: Axes, values: dict[int, float], color: str, label: str, end_label: str | None
+) -> Line2D:
     lengths = sorted(values)
-    axes.plot(
+    (line,) = axes.plot(
         lengths,
         [values[length] for length in lengths],
         color=color,
@@ -291,6 +424,8 @@ def _draw_series(
     )
     # The value at the longest output, next to the end of the line. The line carries the
     # color; the text stays in the text color.
+    if end_label is None:
+        return line
     axes.annotate(
         end_label,
         (lengths[-1], values[lengths[-1]]),
@@ -300,6 +435,33 @@ def _draw_series(
         fontsize=9,
         va="center",
     )
+    return line
+
+
+def _spread_end_labels(axes: Axes, labels: list[tuple[int, float, str]]) -> None:
+    """Writes labels next to the ends of lines, moved apart vertically where they would
+    overlap. Call it after the axis limits are final."""
+    min_gap = 12.0  # points, a little more than the 9-point text
+    to_points = 72 / axes.figure.dpi
+    # Vertical position of each line end in points, lowest first.
+    ends = sorted(
+        (axes.transData.transform((x, y))[1] * to_points, x, y, text) for x, y, text in labels
+    )
+    placed: list[float] = []
+    for height, _, _, _ in ends:
+        placed.append(height if not placed else max(height, placed[-1] + min_gap))
+    # Center the moved group on the line ends, so no label strays far from its line.
+    shift = (sum(h for h, *_ in ends) - sum(placed)) / len(placed) if placed else 0.0
+    for (height, x, y, text), position in zip(ends, placed, strict=True):
+        axes.annotate(
+            text,
+            (x, y),
+            xytext=(8, position + shift - height),
+            textcoords="offset points",
+            color=TEXT,
+            fontsize=9,
+            va="center",
+        )
 
 
 def _style_axes(axes: Axes, lengths: Sequence[int], title: str, xlabel: str) -> None:
@@ -337,6 +499,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     throughput.add_argument(
         "--output", type=Path, required=True, help="path of the chart and table, without suffix"
     )
+    batching = commands.add_parser("batching", help="static against continuous batching")
+    batching.add_argument("result", type=Path, help="batching result file")
+    batching.add_argument(
+        "--output", type=Path, required=True, help="path of the chart and table, without suffix"
+    )
     args = parser.parse_args(argv)
 
     chart = args.output.with_name(args.output.name + ".png")
@@ -345,10 +512,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         results = load_latency_results(args.results)
         plot_latency(results, chart)
         table.write_text(f"{describe(results)}\n\n{latency_table(results)}")
-    else:
+    elif args.command == "throughput":
         result = load_throughput_result(args.result)
         plot_throughput(result, chart)
         table.write_text(f"{describe({'static': result})}\n\n{throughput_table(result)}")
+    else:
+        result = load_batching_result(args.result)
+        plot_batching(result, chart)
+        table.write_text(f"{describe_batching(result)}\n\n{batching_table(result)}")
     print(f"saved {chart}")
     print(f"saved {table}")
     return 0
