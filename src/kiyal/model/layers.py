@@ -106,6 +106,9 @@ def apply_rotary_embedding(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     either trained in this layout or had their q and k projections permuted into it on
     conversion, so the interleaved form gives wrong outputs on them.
 
+    Also takes flattened tokens: x [N, H, D] with cos and sin [N, D/2]. Dimension 1 is the
+    heads in both layouts, which is what the tables broadcast over.
+
     Args:
         x: [B, H, T, D] heads.
         cos: [B, T, D/2] from RotaryEmbedding.

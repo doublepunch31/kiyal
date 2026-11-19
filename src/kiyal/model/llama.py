@@ -1,8 +1,8 @@
 import torch
 from torch import Tensor, nn
 
-from kiyal.cache.contiguous import ContiguousKVCache
-from kiyal.model.attention import Attention, padded_causal_mask
+from kiyal.cache.contiguous import ContiguousKVCache, ContiguousKVPool
+from kiyal.model.attention import Attention, AttentionMetadata, padded_causal_mask
 from kiyal.model.config import ModelConfig
 from kiyal.model.layers import MLP, RMSNorm, RotaryEmbedding
 
@@ -35,6 +35,18 @@ class DecoderLayer(nn.Module):
     ) -> Tensor:
         x = x + self.attn(self.attn_norm(x), cos, sin, cache, mask)  # [B, T, hidden]
         return x + self.mlp(self.mlp_norm(x))  # [B, T, hidden]
+
+    def forward_flat(
+        self,
+        x: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+        pool: ContiguousKVPool,
+        metadata: AttentionMetadata,
+    ) -> Tensor:
+        """Runs the block on a flattened batch; see `LlamaModel.forward_flat`."""
+        x = x + self.attn.forward_flat(self.attn_norm(x), cos, sin, pool, metadata)  # [N, hidden]
+        return x + self.mlp(self.mlp_norm(x))  # [N, hidden]
 
 
 class LlamaModel(nn.Module):
@@ -127,3 +139,39 @@ class LlamaModel(nn.Module):
             selected = hidden.reshape(batch_size * seq_len, -1)[logits_indices]  # [K, hidden]
         # The final norm acts on each token separately, so it runs after selection.
         return self.lm_head(self.norm(selected))  # [K, V]
+
+    def forward_flat(
+        self,
+        input_ids: Tensor,
+        positions: Tensor,
+        pool: ContiguousKVPool,
+        metadata: AttentionMetadata,
+        logits_indices: Tensor,
+    ) -> Tensor:
+        """Computes next-token logits for a flattened batch of sequences.
+
+        The new tokens of all sequences are laid out one after another without padding, so
+        every token-wise layer (projections, MLP, norms) runs on exactly the tokens that
+        exist. Only attention needs to know which sequence a token belongs to, which
+        `metadata` tells it. Sequences in one batch may be at any stage: some can start
+        with their whole prompt while others add one token.
+
+        Args:
+            input_ids: [N] new tokens of every sequence.
+            positions: [N] position of each token in its own sequence.
+            pool: Keys and values of the sequences' earlier tokens. The new tokens' keys
+                and values are added to it.
+            metadata: Which sequence and pool slot each token belongs to.
+            logits_indices: [K] indices into the N tokens to compute logits for, usually
+                the last new token of each sequence.
+
+        Returns:
+            [K, V] logits.
+        """
+        hidden = self.embed_tokens(input_ids)  # [N, hidden]
+        cos, sin = self.rotary(positions, hidden.dtype)  # [N, D/2] each
+        for layer in self.layers:
+            # ModuleList yields plain Modules to the type checker, which knows no forward_flat.
+            assert isinstance(layer, DecoderLayer)
+            hidden = layer.forward_flat(hidden, cos, sin, pool, metadata)  # [N, hidden]
+        return self.lm_head(self.norm(hidden[logits_indices]))  # [K, V]

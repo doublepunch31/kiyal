@@ -6,8 +6,8 @@ import torch
 from torch import Tensor
 from torch.nn.functional import linear
 
-from kiyal.cache.contiguous import ContiguousKVCache
-from kiyal.model.attention import Attention, padded_causal_mask
+from kiyal.cache.contiguous import ContiguousKVCache, ContiguousKVPool
+from kiyal.model.attention import Attention, AttentionMetadata, padded_causal_mask
 from kiyal.model.config import ModelConfig
 from kiyal.model.layers import RotaryEmbedding, apply_rotary_embedding
 
@@ -198,3 +198,91 @@ def test_projection_shapes_follow_head_counts(tiny_config: ModelConfig) -> None:
     x, cos, sin = inputs(config)
     with torch.inference_mode():
         assert attn(x, cos, sin).shape == x.shape
+
+
+def test_metadata_maps_each_token_to_its_pool_slot_and_query_row() -> None:
+    # Sequence 0 in row 2 adds two tokens after three cached ones; sequence 1 in row 0 starts
+    # with one token.
+    metadata = AttentionMetadata.build([2, 0], [3, 0], [2, 1], max_len=8)
+    assert metadata.cache_rows.tolist() == [2, 0]
+    assert metadata.slot_mapping.tolist() == [2 * 8 + 3, 2 * 8 + 4, 0]
+    # Queries are padded to two per sequence: sequence 1's token goes to the third slot.
+    assert metadata.query_slots.tolist() == [0, 1, 2]
+    assert metadata.max_query_len == 2
+    assert metadata.max_seq_len == 5
+
+
+def test_the_metadata_mask_hides_positions_after_each_query() -> None:
+    metadata = AttentionMetadata.build([2, 0], [3, 0], [2, 1], max_len=8)
+    assert metadata.mask.shape == (2, 1, 2, 5)
+    # The new tokens at positions 3 and 4 see the cached tokens and themselves.
+    assert metadata.mask[0, 0].int().tolist() == [[1, 1, 1, 1, 0], [1, 1, 1, 1, 1]]
+    # Sequence 1's single token sees only itself, not the stale positions after it. The
+    # padded second query is not used; it only must not be empty.
+    assert metadata.mask[1, 0].int().tolist() == [[1, 0, 0, 0, 0], [1, 1, 0, 0, 0]]
+
+
+@pytest.mark.parametrize(
+    ("rows", "num_cached", "num_new", "message"),
+    [
+        ([], [], [], "at least one sequence"),
+        ([0, 1], [0], [1, 1], "got 2 rows, 1 cached counts and 2 new counts"),
+        ([0], [2], [0], "sequence 0 must add at least one token"),
+        ([0], [-1], [1], "sequence 0 must add at least one token"),
+        ([0, 1], [0, 6], [1, 3], "sequence 1 would hold 9 tokens, more than a row's 8"),
+    ],
+)
+def test_invalid_metadata_raises(
+    rows: list[int], num_cached: list[int], num_new: list[int], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        AttentionMetadata.build(rows, num_cached, num_new, max_len=8)
+
+
+# Pieces in which three sequences of 7 tokens (rows 2, 0 and 1 of the pool) are fed to
+# flattened attention, one step per entry: (sequence, number of new tokens). Steps mix
+# sequences that start, decode one token, or continue a cached prefix.
+FLAT_STEPS = [
+    [(0, 3), (1, 1)],
+    [(0, 1), (1, 5), (2, 7)],
+    [(0, 3), (1, 1)],
+]
+FLAT_ROWS = [2, 0, 1]
+
+
+@pytest.mark.parametrize("kv_heads", [4, 2, 1], ids=["mha", "gqa", "mqa"])
+@torch.inference_mode()
+def test_flattened_attention_matches_reference_attention(
+    tiny_config: ModelConfig, kv_heads: int
+) -> None:
+    config = dataclasses.replace(tiny_config, num_key_value_heads=kv_heads)
+    torch.manual_seed(0)
+    attn = Attention(config)
+    x, cos, sin = inputs(config, batch_size=3)  # [3, 7, hidden], [3, 7, D/2] each
+    pool = ContiguousKVPool(config, 3, 8)
+    num_done = [0, 0, 0]
+    outputs: list[list[Tensor]] = [[], [], []]
+    for step in FLAT_STEPS:
+        pieces = [slice(num_done[seq], num_done[seq] + size) for seq, size in step]
+        metadata = AttentionMetadata.build(
+            [FLAT_ROWS[seq] for seq, _ in step],
+            [num_done[seq] for seq, _ in step],
+            [size for _, size in step],
+            max_len=8,
+        )
+        out = attn.forward_flat(
+            torch.cat([x[seq, piece] for (seq, _), piece in zip(step, pieces, strict=True)]),
+            torch.cat([cos[seq, piece] for (seq, _), piece in zip(step, pieces, strict=True)]),
+            torch.cat([sin[seq, piece] for (seq, _), piece in zip(step, pieces, strict=True)]),
+            pool,
+            metadata,
+        )  # [N, hidden]
+        for (seq, size), piece_out in zip(step, out.split([s for _, s in step]), strict=True):
+            outputs[seq].append(piece_out)
+            num_done[seq] += size
+    assert num_done == [7, 7, 7]
+    expected = reference_attention(attn, x, cos, sin)
+    for seq in range(3):
+        torch.testing.assert_close(
+            torch.cat(outputs[seq]), expected[seq], rtol=CACHED_RTOL, atol=CACHED_ATOL
+        )

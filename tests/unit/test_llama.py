@@ -4,7 +4,8 @@ import pytest
 import torch
 from torch import Tensor
 
-from kiyal.cache.contiguous import ContiguousKVCache
+from kiyal.cache.contiguous import ContiguousKVCache, ContiguousKVPool
+from kiyal.model.attention import AttentionMetadata
 from kiyal.model.config import ModelConfig
 from kiyal.model.llama import LlamaModel
 
@@ -250,6 +251,137 @@ def test_a_padded_batch_decodes_from_a_cache_like_each_row_alone(model: LlamaMod
         alone = all_logits(model, sequence, torch.arange(sequence.shape[1]).unsqueeze(0))
         torch.testing.assert_close(
             batched[b], alone[0, len(row) - 1 :], rtol=CACHED_RTOL, atol=CACHED_ATOL
+        )
+
+
+FLAT_LENGTHS = [5, 1, 9]
+POOL_LEN = 12
+
+
+def flat_sequences(config: ModelConfig, seed: int = 0) -> list[Tensor]:
+    generator = torch.Generator().manual_seed(seed)
+    return [torch.randint(0, config.vocab_size, (n,), generator=generator) for n in FLAT_LENGTHS]
+
+
+def flat_step(
+    model: LlamaModel,
+    pool: ContiguousKVPool,
+    pieces: list[tuple[int, Tensor, int]],
+) -> list[Tensor]:
+    """Runs one flattened step and returns the logits of every new token, per sequence.
+
+    Args:
+        model: The model.
+        pool: The KV pool the sequences live in.
+        pieces: (pool row, new tokens, number of tokens already in the row) per sequence.
+    """
+    metadata = AttentionMetadata.build(
+        [row for row, _, _ in pieces],
+        [cached for _, _, cached in pieces],
+        [len(tokens) for _, tokens, _ in pieces],
+        pool.max_len,
+    )
+    input_ids = torch.cat([tokens for _, tokens, _ in pieces])  # [N]
+    positions = torch.cat(
+        [torch.arange(cached, cached + len(tokens)) for _, tokens, cached in pieces]
+    )  # [N]
+    logits = model.forward_flat(
+        input_ids, positions, pool, metadata, torch.arange(len(input_ids))
+    )  # [N, V]
+    return list(logits.split([len(tokens) for _, tokens, _ in pieces]))
+
+
+def alone(model: LlamaModel, tokens: Tensor) -> Tensor:
+    """[T, V] logits of every token of one sequence, from the uncached forward."""
+    return all_logits(model, tokens.unsqueeze(0), torch.arange(len(tokens)).unsqueeze(0))[0]
+
+
+@torch.inference_mode()
+def test_a_flattened_prefill_gives_each_sequence_the_logits_it_gets_alone(
+    model: LlamaModel,
+) -> None:
+    sequences = flat_sequences(model.config)
+    pool = ContiguousKVPool(model.config, len(sequences), POOL_LEN)
+    pieces = [(row, tokens, 0) for row, tokens in enumerate(sequences)]
+    for tokens, logits in zip(sequences, flat_step(model, pool, pieces), strict=True):
+        torch.testing.assert_close(logits, alone(model, tokens), rtol=CACHED_RTOL, atol=CACHED_ATOL)
+
+
+@torch.inference_mode()
+def test_flattened_decoding_from_the_pool_matches_the_uncached_forward(
+    model: LlamaModel,
+) -> None:
+    sequences = flat_sequences(model.config)
+    # Rows in another order than the sequences, so a mix-up of rows shows.
+    rows = [2, 0, 1]
+    pool = ContiguousKVPool(model.config, len(sequences), POOL_LEN)
+    num_done = [3, 1, 6]
+    prefill = [
+        (row, tokens[:n], 0) for row, tokens, n in zip(rows, sequences, num_done, strict=True)
+    ]
+    logits = [[piece] for piece in flat_step(model, pool, prefill)]
+    # Then one token per sequence and step. A sequence leaves the batch once it has used all
+    # of its tokens, and the others continue.
+    while active := [b for b, tokens in enumerate(sequences) if num_done[b] < len(tokens)]:
+        pieces = [
+            (rows[b], sequences[b][num_done[b] : num_done[b] + 1], num_done[b]) for b in active
+        ]
+        for b, piece in zip(active, flat_step(model, pool, pieces), strict=True):
+            logits[b].append(piece)
+            num_done[b] += 1
+    for b, tokens in enumerate(sequences):
+        torch.testing.assert_close(
+            torch.cat(logits[b]), alone(model, tokens), rtol=CACHED_RTOL, atol=CACHED_ATOL
+        )
+
+
+@torch.inference_mode()
+def test_a_step_can_mix_prefill_decode_and_a_prompt_after_a_cached_prefix(
+    model: LlamaModel,
+) -> None:
+    first, second, third = flat_sequences(model.config)
+    pool = ContiguousKVPool(model.config, 3, POOL_LEN)
+    before = flat_step(model, pool, [(0, first[:4], 0), (1, third[:2], 0)])
+    # First decodes its last token, second starts, third continues after two cached tokens.
+    mixed = flat_step(model, pool, [(0, first[4:], 4), (2, second, 0), (1, third[2:], 2)])
+    torch.testing.assert_close(
+        torch.cat([before[0], mixed[0]]), alone(model, first), rtol=CACHED_RTOL, atol=CACHED_ATOL
+    )
+    torch.testing.assert_close(mixed[1], alone(model, second), rtol=CACHED_RTOL, atol=CACHED_ATOL)
+    torch.testing.assert_close(
+        torch.cat([before[1], mixed[2]]), alone(model, third), rtol=CACHED_RTOL, atol=CACHED_ATOL
+    )
+
+
+@torch.inference_mode()
+def test_a_reused_row_ignores_what_its_previous_sequence_left(model: LlamaModel) -> None:
+    short, _, long = flat_sequences(model.config)
+    other = flat_sequences(model.config, seed=1)[2]
+    fresh = ContiguousKVPool(model.config, 2, POOL_LEN)
+    used = ContiguousKVPool(model.config, 2, POOL_LEN)
+    # A longer sequence held row 0 before and ended; its keys and values stay behind.
+    flat_step(model, used, [(0, other, 0)])
+    pieces = [(0, short, 0), (1, long, 0)]
+    for expected, actual in zip(
+        flat_step(model, fresh, pieces), flat_step(model, used, pieces), strict=True
+    ):
+        # Stale positions get a weight of exactly 0, so the logits are unchanged to the bit.
+        assert torch.equal(actual, expected)
+
+
+@torch.inference_mode()
+def test_flattened_logits_are_computed_for_the_requested_tokens_only(model: LlamaModel) -> None:
+    sequences = flat_sequences(model.config)
+    pool = ContiguousKVPool(model.config, len(sequences), POOL_LEN)
+    metadata = AttentionMetadata.build([0, 1, 2], [0, 0, 0], FLAT_LENGTHS, POOL_LEN)
+    input_ids = torch.cat(sequences)
+    positions = torch.cat([torch.arange(n) for n in FLAT_LENGTHS])
+    last_tokens = torch.tensor(FLAT_LENGTHS).cumsum(0) - 1  # [3]
+    logits = model.forward_flat(input_ids, positions, pool, metadata, last_tokens)
+    assert logits.shape == (3, model.config.vocab_size)
+    for b, tokens in enumerate(sequences):
+        torch.testing.assert_close(
+            logits[b], alone(model, tokens)[-1], rtol=CACHED_RTOL, atol=CACHED_ATOL
         )
 
 
