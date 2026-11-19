@@ -1,4 +1,8 @@
+import torch
 from torch import Tensor
+
+from kiyal.cache.contiguous import ContiguousKVCache
+from kiyal.model.llama import LlamaModel
 
 
 def assert_greedy_equivalent(actual: Tensor, expected: Tensor, atol: float) -> None:
@@ -34,3 +38,21 @@ def near_tie_steps(logits: Tensor, atol: float) -> Tensor:
     """
     top2 = logits.topk(2, dim=-1).values  # [steps, 2]
     return (top2[:, 0] - top2[:, 1]) <= 2 * atol
+
+
+@torch.inference_mode()
+def single_greedy(model: LlamaModel, prompt: list[int], num_steps: int) -> tuple[Tensor, Tensor]:
+    """Decodes one prompt alone with a KV cache, the reference for the batching rungs.
+
+    Returns:
+        The [num_steps, V] logits of every step and the [num_steps] tokens chosen from them.
+    """
+    cache = ContiguousKVCache(model.config, 1, len(prompt) + num_steps - 1)
+    positions = torch.arange(len(prompt)).unsqueeze(0)  # [1, T]
+    logits = [model(torch.tensor([prompt]), positions, cache=cache)]  # prefill, [1, V]
+    tokens = [logits[-1].argmax(dim=-1)]  # [1] each
+    for _ in range(num_steps - 1):
+        position = torch.tensor([[cache.length]])  # [1, 1]
+        logits.append(model(tokens[-1].view(1, 1), position, cache=cache))  # decode
+        tokens.append(logits[-1].argmax(dim=-1))
+    return torch.cat(logits), torch.cat(tokens)

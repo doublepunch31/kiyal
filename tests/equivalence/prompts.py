@@ -1,3 +1,7 @@
+from collections.abc import Sequence
+
+import torch
+
 from kiyal.tokenizer import Tokenizer
 
 # Variants of the tiny model whose attention has other shapes: one KV head per query head,
@@ -28,3 +32,8 @@ SMOLLM2_PROMPTS: dict[str, str | list[dict[str, str]]] = {
 
 def encode_prompt(tokenizer: Tokenizer, prompt: str | list[dict[str, str]]) -> list[int]:
     return tokenizer.encode(prompt) if isinstance(prompt, str) else tokenizer.encode_chat(prompt)
+
+
+def random_prompts(vocab_size: int, lengths: Sequence[int]) -> list[list[int]]:
+    generator = torch.Generator().manual_seed(0)
+    return [torch.randint(0, vocab_size, (n,), generator=generator).tolist() for n in lengths]

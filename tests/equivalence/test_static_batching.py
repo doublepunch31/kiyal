@@ -11,8 +11,14 @@ from kiyal.engine.sequence import SamplingParams
 from kiyal.model.llama import LlamaModel
 from kiyal.model.loader import load_model
 from kiyal.tokenizer import Tokenizer
-from tests.equivalence.greedy import assert_greedy_equivalent, near_tie_steps
-from tests.equivalence.prompts import SMOLLM2_PROMPTS, TINY_TEXTS, TINY_VARIANTS, encode_prompt
+from tests.equivalence.greedy import assert_greedy_equivalent, near_tie_steps, single_greedy
+from tests.equivalence.prompts import (
+    SMOLLM2_PROMPTS,
+    TINY_TEXTS,
+    TINY_VARIANTS,
+    encode_prompt,
+    random_prompts,
+)
 
 CPU = torch.device("cpu")
 # Largest differences between batched and single-prompt logits measured on an Apple M4: 2.5e-6
@@ -22,24 +28,6 @@ TINY_ATOL = 2e-5
 SMOLLM2_ATOL = 1e-3
 # Prompts of different lengths need padding; prompts of equal length run without it.
 TINY_PROMPT_LENGTHS = {"padded": [1, 7, 40, 19], "unpadded": [16, 16, 16]}
-
-
-@torch.inference_mode()
-def single_greedy(model: LlamaModel, prompt: list[int], num_steps: int) -> tuple[Tensor, Tensor]:
-    """Decodes one prompt greedily with a KV cache, the step before batching on the ladder.
-
-    Returns:
-        The [num_steps, V] logits of every step and the [num_steps] tokens chosen from them.
-    """
-    cache = ContiguousKVCache(model.config, 1, len(prompt) + num_steps - 1)
-    positions = torch.arange(len(prompt)).unsqueeze(0)  # [1, T]
-    logits = [model(torch.tensor([prompt]), positions, cache=cache)]  # prefill, [1, V]
-    tokens = [logits[-1].argmax(dim=-1)]  # [1] each
-    for _ in range(num_steps - 1):
-        position = torch.tensor([[cache.length]])  # [1, 1]
-        logits.append(model(tokens[-1].view(1, 1), position, cache=cache))  # decode
-        tokens.append(logits[-1].argmax(dim=-1))
-    return torch.cat(logits), torch.cat(tokens)
 
 
 @torch.inference_mode()
@@ -70,11 +58,6 @@ def batched_logits(model: LlamaModel, prompts: Sequence[list[int]], tokens: Tens
         step_tokens = tokens[:, step : step + 1]  # [B, 1]
         logits.append(model(step_tokens, positions, cache=cache, left_padding=left_padding))
     return torch.stack(logits, dim=1)
-
-
-def random_prompts(vocab_size: int, lengths: Sequence[int]) -> list[list[int]]:
-    generator = torch.Generator().manual_seed(0)
-    return [torch.randint(0, vocab_size, (n,), generator=generator).tolist() for n in lengths]
 
 
 def assert_batched_logits_match(
