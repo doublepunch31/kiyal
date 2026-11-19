@@ -207,6 +207,24 @@ class Sequence:
         self.finished_time = time.perf_counter()
 
 
+@dataclass(frozen=True, slots=True)
+class RequestOutput:
+    """What one engine step added to the output of a request.
+
+    Attributes:
+        request_id: The request.
+        token_id: The token generated in this step.
+        text: Text to append to the output. Empty when the token ends inside a character or
+            in a possible stop string, and for a stop token.
+        finish_reason: Set on the request's last output, None before it.
+    """
+
+    request_id: str
+    token_id: int
+    text: str
+    finish_reason: FinishReason | None
+
+
 class SequenceFactory:
     """Turns prompts and sampling settings into sequences for one model and tokenizer.
 
