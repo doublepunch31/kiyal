@@ -6,7 +6,8 @@ import torch
 from torch import Tensor
 from torch.nn.functional import linear
 
-from kiyal.cache.contiguous import ContiguousKVCache, ContiguousKVPool
+from kiyal.cache.contiguous import ContiguousKVCache
+from kiyal.cache.paged import PagedKVPool
 from kiyal.model.attention import Attention, AttentionMetadata, padded_causal_mask
 from kiyal.model.config import ModelConfig
 from kiyal.model.layers import RotaryEmbedding, apply_rotary_embedding
@@ -201,14 +202,16 @@ def test_projection_shapes_follow_head_counts(tiny_config: ModelConfig) -> None:
 
 
 def test_metadata_maps_each_token_to_its_pool_slot_and_query_row() -> None:
-    # Sequence 0 in row 2 adds two tokens after three cached ones; sequence 1 in row 0 starts
-    # with one token.
-    metadata = AttentionMetadata.build([2, 0], [3, 0], [2, 1], max_len=8)
-    # A step with more than one new token gathers its sequences' rows, in order.
-    assert metadata.cache_rows is not None
-    assert metadata.cache_rows.tolist() == [2, 0]
+    # Sequence 0 adds two tokens after three cached ones, in blocks 5 and 2 of 4 positions;
+    # sequence 1 starts with one token in block 0.
+    metadata = AttentionMetadata.build([[5, 2], [0]], [3, 0], [2, 1], block_size=4)
+    # Position 3 is the last of block 5, position 4 the first of block 2.
+    assert metadata.slot_mapping.tolist() == [5 * 4 + 3, 2 * 4 + 0, 0]
+    # A step with more than one new token gathers its sequences' blocks, in order. Block 0
+    # stands in for sequence 1's missing second block.
+    assert metadata.block_tables is not None
+    assert metadata.block_tables.tolist() == [[5, 2], [0, 0]]
     assert metadata.num_attention_rows == 2
-    assert metadata.slot_mapping.tolist() == [2 * 8 + 3, 2 * 8 + 4, 0]
     # Queries are padded to two per sequence: sequence 1's token goes to the third slot.
     assert metadata.query_slots.tolist() == [0, 1, 2]
     assert metadata.max_query_len == 2
@@ -216,7 +219,7 @@ def test_metadata_maps_each_token_to_its_pool_slot_and_query_row() -> None:
 
 
 def test_the_metadata_mask_hides_positions_after_each_query() -> None:
-    metadata = AttentionMetadata.build([2, 0], [3, 0], [2, 1], max_len=8)
+    metadata = AttentionMetadata.build([[5, 2], [0]], [3, 0], [2, 1], block_size=4)
     assert metadata.mask.shape == (2, 1, 2, 5)
     # The new tokens at positions 3 and 4 see the cached tokens and themselves.
     assert metadata.mask[0, 0].int().tolist() == [[1, 1, 1, 1, 0], [1, 1, 1, 1, 1]]
@@ -225,70 +228,92 @@ def test_the_metadata_mask_hides_positions_after_each_query() -> None:
     assert metadata.mask[1, 0].int().tolist() == [[1, 0, 0, 0, 0], [1, 1, 0, 0, 0]]
 
 
-def test_a_decode_step_reads_the_pool_rows_in_place() -> None:
-    # Sequence 0 in row 2 decodes its fourth token and sequence 1 in row 0 its second; row 1
-    # holds no sequence of this step.
-    metadata = AttentionMetadata.build([2, 0], [3, 1], [1, 1], max_len=8)
-    assert metadata.cache_rows is None
+def test_a_decode_step_within_first_blocks_reads_them_in_place() -> None:
+    # Sequence 0 in block 2 decodes its fourth token and sequence 1 in block 0 its second;
+    # block 1 holds no sequence of this step.
+    metadata = AttentionMetadata.build([[2], [0]], [3, 1], [1, 1], block_size=8)
+    assert metadata.block_tables is None
     assert metadata.num_attention_rows == 3
     assert metadata.slot_mapping.tolist() == [2 * 8 + 3, 1]
-    # Each query goes to its sequence's pool row.
+    # Each query goes to its sequence's block.
     assert metadata.query_slots.tolist() == [2, 0]
     assert metadata.mask.shape == (3, 1, 1, 4)
     assert metadata.mask[0, 0].int().tolist() == [[1, 1, 0, 0]]
-    # The unused query of row 1 sees key 0 only, whatever the row holds after it.
+    # The unused query of block 1 sees key 0 only, whatever the block holds after it.
     assert metadata.mask[1, 0].int().tolist() == [[1, 0, 0, 0]]
     assert metadata.mask[2, 0].int().tolist() == [[1, 1, 1, 1]]
 
 
+def test_a_decode_step_past_a_first_block_gathers_the_blocks() -> None:
+    # Sequence 0 decodes its fifth token, the first of its second block.
+    metadata = AttentionMetadata.build([[1, 3], [0]], [4, 1], [1, 1], block_size=4)
+    assert metadata.block_tables is not None
+    assert metadata.block_tables.tolist() == [[1, 3], [0, 0]]
+    assert metadata.num_attention_rows == 2
+    assert metadata.slot_mapping.tolist() == [3 * 4 + 0, 1]
+    assert metadata.query_slots.tolist() == [0, 1]
+    assert metadata.mask[:, 0].int().tolist() == [[[1, 1, 1, 1, 1]], [[1, 1, 0, 0, 0]]]
+
+
 @pytest.mark.parametrize(
-    ("rows", "num_cached", "num_new", "message"),
+    ("block_tables", "num_cached", "num_new", "message"),
     [
         ([], [], [], "at least one sequence"),
-        ([1, 1], [0, 0], [1, 1], "two sequences share a pool row"),
-        ([0, 1], [0], [1, 1], "got 2 rows, 1 cached counts and 2 new counts"),
-        ([0], [2], [0], "sequence 0 must add at least one token"),
-        ([0], [-1], [1], "sequence 0 must add at least one token"),
-        ([0, 1], [0, 6], [1, 3], "sequence 1 would hold 9 tokens, more than a row's 8"),
+        ([[0], [1]], [0], [1, 1], "got 2 block tables, 1 cached counts and 2 new counts"),
+        ([[0]], [2], [0], "sequence 0 must add at least one token"),
+        ([[0]], [-1], [1], "sequence 0 must add at least one token"),
+        ([[0], [1]], [0, 6], [1, 3], "sequence 1 would hold 9 tokens, but its block table"),
+        ([[1], [1]], [0, 0], [1, 1], "two tokens of the step would be written to one pool slot"),
+        ([[1], [1]], [0, 2], [1, 1], r"two sequences share their first block: \[1, 1\]"),
     ],
 )
 def test_invalid_metadata_raises(
-    rows: list[int], num_cached: list[int], num_new: list[int], message: str
+    block_tables: list[list[int]], num_cached: list[int], num_new: list[int], message: str
 ) -> None:
     with pytest.raises(ValueError, match=message):
-        AttentionMetadata.build(rows, num_cached, num_new, max_len=8)
+        AttentionMetadata.build(block_tables, num_cached, num_new, block_size=8)
 
 
-# Pieces in which three sequences of 7 tokens (rows 2, 0 and 1 of the pool) are fed to
-# flattened attention, one step per entry: (sequence, number of new tokens). Steps mix
-# sequences that start, decode one token, or continue a cached prefix.
+# Pieces in which three sequences of 7 tokens are fed to flattened attention, one step per
+# entry: (sequence, number of new tokens). Steps mix sequences that start, decode one token,
+# or continue a cached prefix.
 FLAT_STEPS = [
     [(0, 3), (1, 1)],
     [(0, 1), (1, 5), (2, 7)],
     [(0, 3), (1, 1)],
 ]
-FLAT_ROWS = [2, 0, 1]
+FLAT_SEQ_LEN = 7
 
 
+def scattered_block_tables(num_sequences: int, seq_len: int, block_size: int) -> list[list[int]]:
+    """Block tables for sequences whose blocks are spread over the pool in random order."""
+    num_blocks = -(-seq_len // block_size)
+    order = torch.randperm(num_sequences * num_blocks, generator=torch.Generator().manual_seed(0))
+    return order.view(num_sequences, num_blocks).tolist()
+
+
+# A block of 8 holds a whole sequence, like a row of a contiguous pool.
+@pytest.mark.parametrize("block_size", [1, 3, 8])
 @pytest.mark.parametrize("kv_heads", [4, 2, 1], ids=["mha", "gqa", "mqa"])
 @torch.inference_mode()
 def test_flattened_attention_matches_reference_attention(
-    tiny_config: ModelConfig, kv_heads: int
+    tiny_config: ModelConfig, kv_heads: int, block_size: int
 ) -> None:
     config = dataclasses.replace(tiny_config, num_key_value_heads=kv_heads)
     torch.manual_seed(0)
     attn = Attention(config)
     x, cos, sin = inputs(config, batch_size=3)  # [3, 7, hidden], [3, 7, D/2] each
-    pool = ContiguousKVPool(config, 3, 8)
+    tables = scattered_block_tables(3, FLAT_SEQ_LEN, block_size)
+    pool = PagedKVPool(config, sum(len(table) for table in tables), block_size)
     num_done = [0, 0, 0]
     outputs: list[list[Tensor]] = [[], [], []]
     for step in FLAT_STEPS:
         pieces = [slice(num_done[seq], num_done[seq] + size) for seq, size in step]
         metadata = AttentionMetadata.build(
-            [FLAT_ROWS[seq] for seq, _ in step],
+            [tables[seq] for seq, _ in step],
             [num_done[seq] for seq, _ in step],
             [size for _, size in step],
-            max_len=8,
+            block_size,
         )
         out = attn.forward_flat(
             torch.cat([x[seq, piece] for (seq, _), piece in zip(step, pieces, strict=True)]),
@@ -300,7 +325,7 @@ def test_flattened_attention_matches_reference_attention(
         for (seq, size), piece_out in zip(step, out.split([s for _, s in step]), strict=True):
             outputs[seq].append(piece_out)
             num_done[seq] += size
-    assert num_done == [7, 7, 7]
+    assert num_done == [FLAT_SEQ_LEN] * 3
     expected = reference_attention(attn, x, cos, sin)
     for seq in range(3):
         torch.testing.assert_close(

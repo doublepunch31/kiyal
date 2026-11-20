@@ -1,7 +1,8 @@
 import torch
 from torch import Tensor, nn
 
-from kiyal.cache.contiguous import ContiguousKVCache, ContiguousKVPool
+from kiyal.cache.contiguous import ContiguousKVCache
+from kiyal.cache.paged import PagedKVPool
 from kiyal.model.attention import Attention, AttentionMetadata, padded_causal_mask
 from kiyal.model.config import ModelConfig
 from kiyal.model.layers import MLP, RMSNorm, RotaryEmbedding
@@ -41,7 +42,7 @@ class DecoderLayer(nn.Module):
         x: Tensor,
         cos: Tensor,
         sin: Tensor,
-        pool: ContiguousKVPool,
+        pool: PagedKVPool,
         metadata: AttentionMetadata,
     ) -> Tensor:
         """Runs the block on a flattened batch; see `LlamaModel.forward_flat`."""
@@ -144,7 +145,7 @@ class LlamaModel(nn.Module):
         self,
         input_ids: Tensor,
         positions: Tensor,
-        pool: ContiguousKVPool,
+        pool: PagedKVPool,
         metadata: AttentionMetadata,
         logits_indices: Tensor,
     ) -> Tensor:

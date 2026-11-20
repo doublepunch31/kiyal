@@ -1,7 +1,7 @@
 import torch
 from torch import Tensor
 
-from kiyal.cache.contiguous import ContiguousKVPool
+from kiyal.cache.paged import PagedKVPool
 from kiyal.engine.sequence import Sequence
 from kiyal.model.attention import AttentionMetadata
 from kiyal.model.llama import LlamaModel
@@ -25,7 +25,8 @@ class ModelRunner:
         """
         self._model = model
         self._device = model.embed_tokens.weight.device
-        self.pool = ContiguousKVPool(
+        # One block per row, as long as the longest sequence.
+        self.pool = PagedKVPool(
             model.config,
             num_rows,
             max_len,
@@ -45,7 +46,7 @@ class ModelRunner:
         """
         token_ids: list[int] = []
         positions: list[int] = []
-        rows: list[int] = []
+        block_tables: list[list[int]] = []
         num_cached: list[int] = []
         num_new: list[int] = []
         logits_indices: list[int] = []
@@ -55,14 +56,14 @@ class ModelRunner:
             start = seq.num_computed_tokens
             token_ids += new_token_ids
             positions += range(start, start + len(new_token_ids))
-            rows.append(seq.cache_row)
+            block_tables.append([seq.cache_row])
             num_cached.append(start)
             num_new.append(len(new_token_ids))
             # Only the last new token predicts the next one.
             logits_indices.append(len(token_ids) - 1)
 
         metadata = AttentionMetadata.build(
-            rows, num_cached, num_new, self.pool.max_len, self._device
+            block_tables, num_cached, num_new, self.pool.block_size, self._device
         )
         return self._model.forward_flat(
             torch.tensor(token_ids, device=self._device),  # [N]

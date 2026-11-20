@@ -6,7 +6,8 @@ import torch
 from torch import Tensor, nn
 from torch.nn.functional import scaled_dot_product_attention
 
-from kiyal.cache.contiguous import ContiguousKVCache, ContiguousKVPool
+from kiyal.cache.contiguous import ContiguousKVCache
+from kiyal.cache.paged import PagedKVPool
 from kiyal.model.config import ModelConfig
 from kiyal.model.layers import apply_rotary_embedding
 
@@ -16,10 +17,10 @@ class AttentionMetadata:
     """Which sequence each token of a flattened batch belongs to, and where its keys go.
 
     A flattened batch lays the new tokens of B sequences one after another, N in all, with
-    no padding. Sequence b has `num_cached[b]` tokens in its row of the KV pool already and
-    adds `num_new[b]`: its whole prompt when it starts (prefill), one token per step after
-    that (decode), or a part of the prompt after a cached prefix. Built once per step and
-    shared by every layer.
+    no padding. Sequence b has `num_cached[b]` tokens in the KV pool already and adds
+    `num_new[b]`: its whole prompt when it starts (prefill), one token per step after that
+    (decode), or a part of the prompt after a cached prefix. Its block table lists the pool
+    blocks that hold its tokens, in order. Built once per step and shared by every layer.
 
     Attention needs a [rows, tokens] layout, so each layer scatters the queries into A rows
     of Q, the most new tokens of any sequence, and attends over A rows of L keys from the
@@ -27,25 +28,27 @@ class AttentionMetadata:
     the causal mask hides the key positions past each query's own.
 
     The A attention rows are one of two things:
-    - In decode steps (Q = 1), the pool rows 0 to A - 1, read in place without copying,
-      A - 1 being the highest row of the step. A sequence's queries go to its own pool row.
-      Rows without a sequence of the step get an unused query each, which costs little,
-      while copying the rows out of the pool would cost more than attention itself.
-    - In other steps, the B rows of the step's sequences, gathered from the pool in their
-      order (A = B). With long queries, every extra row would cost Q queries.
+    - In decode steps (Q = 1) in which every sequence fits in its first block, the pool
+      blocks 0 to A - 1, read in place without copying, A - 1 being the highest block of
+      the step. A sequence's query goes to its own block's row. Blocks without a sequence
+      of the step get an unused query each, which costs little, while copying the blocks
+      out of the pool would cost more than attention itself. With a block as long as the
+      longest sequence, as in a contiguous pool, every decode step reads in place.
+    - In other steps, the B sequences of the step, each gathered from its blocks in order
+      (A = B). With long queries, every extra row would cost Q queries.
 
     Attributes:
-        cache_rows: [B] pool row of each sequence to gather, or None when the pool rows are
-            read in place.
+        block_tables: [B, MB] blocks of each sequence to gather, MB blocks being enough
+            for L positions, or None when the blocks are read in place.
         num_attention_rows: A.
-        slot_mapping: [N] pool slot of each new token, `row * max_len + position`.
+        slot_mapping: [N] pool slot of each new token, `block * block_size + offset`.
         query_slots: [N] index of each new token in the padded [A * Q] query layout.
         mask: [A, 1, Q, L] True where a query may attend to a key. Broadcasts over heads.
         max_query_len: Q.
         max_seq_len: L.
     """
 
-    cache_rows: Tensor | None
+    block_tables: Tensor | None
     num_attention_rows: int
     slot_mapping: Tensor
     query_slots: Tensor
@@ -56,60 +59,73 @@ class AttentionMetadata:
     @classmethod
     def build(
         cls,
-        cache_rows: Sequence[int],
+        block_tables: Sequence[Sequence[int]],
         num_cached: Sequence[int],
         num_new: Sequence[int],
-        max_len: int,
+        block_size: int,
         device: torch.device | None = None,
     ) -> Self:
         """Describes a step in which sequence b adds `num_new[b]` tokens after `num_cached[b]`.
 
         Args:
-            cache_rows: Pool row of each sequence.
-            num_cached: Tokens of each sequence already in its row.
+            block_tables: Pool blocks of each sequence, in order, with room for its cached
+                and new tokens.
+            num_cached: Tokens of each sequence already in the pool.
             num_new: Tokens each sequence adds in this step, at least 1.
-            max_len: Positions per row of the pool.
+            block_size: Positions per block of the pool.
             device: Device of the tensors.
 
         Raises:
-            ValueError: If there are no sequences, the lists differ in length, two sequences
-                share a row, a sequence adds no tokens, or a sequence would not fit its row.
+            ValueError: If there are no sequences, the lists differ in length, a sequence
+                adds no tokens or would not fit its blocks, or two tokens would be written
+                to one slot.
         """
-        if not cache_rows:
+        if not block_tables:
             raise ValueError("a step needs at least one sequence")
-        if not len(cache_rows) == len(num_cached) == len(num_new):
+        if not len(block_tables) == len(num_cached) == len(num_new):
             raise ValueError(
-                f"got {len(cache_rows)} rows, {len(num_cached)} cached counts and "
+                f"got {len(block_tables)} block tables, {len(num_cached)} cached counts and "
                 f"{len(num_new)} new counts"
             )
-        if len(set(cache_rows)) != len(cache_rows):
-            raise ValueError(f"two sequences share a pool row: {list(cache_rows)}")
         seq_lens = [cached + new for cached, new in zip(num_cached, num_new, strict=True)]
-        for index, (cached, new) in enumerate(zip(num_cached, num_new, strict=True)):
+        for index, (table, cached, new) in enumerate(
+            zip(block_tables, num_cached, num_new, strict=True)
+        ):
             if cached < 0 or new < 1:
                 raise ValueError(
                     f"sequence {index} must add at least one token after 0 or more, got "
                     f"{new} after {cached}"
                 )
-            if cached + new > max_len:
+            if cached + new > len(table) * block_size:
                 raise ValueError(
-                    f"sequence {index} would hold {cached + new} tokens, more than a row's "
-                    f"{max_len}"
+                    f"sequence {index} would hold {cached + new} tokens, but its block table "
+                    f"has room for {len(table) * block_size}"
                 )
         max_query_len = max(num_new)
         max_seq_len = max(seq_lens)
         slot_mapping = [
-            row * max_len + position
-            for row, cached, length in zip(cache_rows, num_cached, seq_lens, strict=True)
+            table[position // block_size] * block_size + position % block_size
+            for table, cached, length in zip(block_tables, num_cached, seq_lens, strict=True)
             for position in range(cached, length)
         ]
-        in_place = max_query_len == 1
+        if len(set(slot_mapping)) != len(slot_mapping):
+            raise ValueError("two tokens of the step would be written to one pool slot")
+        in_place = max_query_len == 1 and max_seq_len <= block_size
+        gather_tables: list[list[int]] = []
         if in_place:
-            attention_rows = list(cache_rows)
-            num_attention_rows = max(cache_rows) + 1
+            attention_rows = [table[0] for table in block_tables]
+            if len(set(attention_rows)) != len(attention_rows):
+                raise ValueError(f"two sequences share their first block: {attention_rows}")
+            num_attention_rows = max(attention_rows) + 1
         else:
-            attention_rows = list(range(len(cache_rows)))
-            num_attention_rows = len(cache_rows)
+            attention_rows = list(range(len(block_tables)))
+            num_attention_rows = len(block_tables)
+            num_table_blocks = -(-max_seq_len // block_size)
+            for table in block_tables:
+                blocks = list(table[:num_table_blocks])
+                # A shorter sequence's missing blocks are filled with block 0: the mask
+                # hides every position past its end, wherever those positions come from.
+                gather_tables.append(blocks + [0] * (num_table_blocks - len(blocks)))
         query_slots = [
             row * max_query_len + offset
             for row, new in zip(attention_rows, num_new, strict=True)
@@ -122,16 +138,16 @@ class AttentionMetadata:
 
         # Query i of a row sits at position row_cached + i and sees the keys up to its own
         # position. Causality alone keeps it inside its sequence: every later position in
-        # the row is padding or was left by a sequence that held the row before. A padded
-        # query (i >= num_new[b]) sees more than its sequence, but never nothing, so its
-        # softmax stays finite, and its result is thrown away.
+        # the row is padding, a stand-in block, or was left by a sequence that held the
+        # block before. A padded query (i >= num_new[b]) sees more than its sequence, but
+        # never nothing, so its softmax stays finite, and its result is thrown away.
         query_positions = torch.tensor(row_cached, device=device).unsqueeze(-1) + torch.arange(
             max_query_len, device=device
         )  # [A, Q]
         key_positions = torch.arange(max_seq_len, device=device)  # [L]
         mask = key_positions <= query_positions.unsqueeze(-1)  # [A, Q, L]
         return cls(
-            cache_rows=None if in_place else torch.tensor(cache_rows, device=device),
+            block_tables=None if in_place else torch.tensor(gather_tables, device=device),
             num_attention_rows=num_attention_rows,
             slot_mapping=torch.tensor(slot_mapping, device=device),
             query_slots=torch.tensor(query_slots, device=device),
@@ -238,7 +254,7 @@ class Attention(nn.Module):
         x: Tensor,
         cos: Tensor,
         sin: Tensor,
-        pool: ContiguousKVPool,
+        pool: PagedKVPool,
         metadata: AttentionMetadata,
     ) -> Tensor:
         """Attends each token of a flattened batch to the tokens of its own sequence.
@@ -264,10 +280,12 @@ class Attention(nn.Module):
         k = apply_rotary_embedding(k, cos, sin)  # [N, Hkv, D]
         pool.write(self.layer_index, metadata.slot_mapping, k, v)
         num_rows = metadata.num_attention_rows
-        if metadata.cache_rows is None:
+        if metadata.block_tables is None:
             keys, values = pool.view(self.layer_index, num_rows, metadata.max_seq_len)
         else:
-            keys, values = pool.read(self.layer_index, metadata.cache_rows, metadata.max_seq_len)
+            keys, values = pool.gather(
+                self.layer_index, metadata.block_tables, metadata.max_seq_len
+            )
         # keys, values: [A, Hkv, L, D] each
 
         num_queries = metadata.max_query_len

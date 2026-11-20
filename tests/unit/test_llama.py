@@ -4,7 +4,8 @@ import pytest
 import torch
 from torch import Tensor
 
-from kiyal.cache.contiguous import ContiguousKVCache, ContiguousKVPool
+from kiyal.cache.contiguous import ContiguousKVCache
+from kiyal.cache.paged import PagedKVPool
 from kiyal.model.attention import AttentionMetadata
 from kiyal.model.config import ModelConfig
 from kiyal.model.llama import LlamaModel
@@ -255,6 +256,7 @@ def test_a_padded_batch_decodes_from_a_cache_like_each_row_alone(model: LlamaMod
 
 
 FLAT_LENGTHS = [5, 1, 9]
+# Room for every flat sequence in one block, like a row of a contiguous pool.
 POOL_LEN = 12
 
 
@@ -263,23 +265,28 @@ def flat_sequences(config: ModelConfig, seed: int = 0) -> list[Tensor]:
     return [torch.randint(0, config.vocab_size, (n,), generator=generator) for n in FLAT_LENGTHS]
 
 
+def one_block_pool(config: ModelConfig, num_sequences: int) -> PagedKVPool:
+    return PagedKVPool(config, num_sequences, POOL_LEN)
+
+
 def flat_step(
     model: LlamaModel,
-    pool: ContiguousKVPool,
-    pieces: list[tuple[int, Tensor, int]],
+    pool: PagedKVPool,
+    pieces: list[tuple[list[int], Tensor, int]],
 ) -> list[Tensor]:
     """Runs one flattened step and returns the logits of every new token, per sequence.
 
     Args:
         model: The model.
         pool: The KV pool the sequences live in.
-        pieces: (pool row, new tokens, number of tokens already in the row) per sequence.
+        pieces: (block table, new tokens, number of tokens already in the pool) per
+            sequence.
     """
     metadata = AttentionMetadata.build(
-        [row for row, _, _ in pieces],
+        [table for table, _, _ in pieces],
         [cached for _, _, cached in pieces],
         [len(tokens) for _, tokens, _ in pieces],
-        pool.max_len,
+        pool.block_size,
     )
     input_ids = torch.cat([tokens for _, tokens, _ in pieces])  # [N]
     positions = torch.cat(
@@ -301,30 +308,35 @@ def test_a_flattened_prefill_gives_each_sequence_the_logits_it_gets_alone(
     model: LlamaModel,
 ) -> None:
     sequences = flat_sequences(model.config)
-    pool = ContiguousKVPool(model.config, len(sequences), POOL_LEN)
-    pieces = [(row, tokens, 0) for row, tokens in enumerate(sequences)]
+    pool = one_block_pool(model.config, len(sequences))
+    pieces = [([block], tokens, 0) for block, tokens in enumerate(sequences)]
     for tokens, logits in zip(sequences, flat_step(model, pool, pieces), strict=True):
         torch.testing.assert_close(logits, alone(model, tokens), rtol=CACHED_RTOL, atol=CACHED_ATOL)
 
 
+# Blocks of 12 hold a whole sequence, so decode steps read the pool in place. Smaller blocks
+# spread each sequence over the pool, and decode steps gather them.
+@pytest.mark.parametrize("block_size", [POOL_LEN, 4, 1])
 @torch.inference_mode()
 def test_flattened_decoding_from_the_pool_matches_the_uncached_forward(
-    model: LlamaModel,
+    model: LlamaModel, block_size: int
 ) -> None:
     sequences = flat_sequences(model.config)
-    # Rows in another order than the sequences, so a mix-up of rows shows.
-    rows = [2, 0, 1]
-    pool = ContiguousKVPool(model.config, len(sequences), POOL_LEN)
+    # Blocks in another order than the sequences, so a mix-up of blocks shows.
+    num_blocks = [-(-len(tokens) // block_size) for tokens in sequences]
+    order = torch.randperm(sum(num_blocks), generator=torch.Generator().manual_seed(0)).tolist()
+    tables = [order[sum(num_blocks[:b]) : sum(num_blocks[: b + 1])] for b in range(3)]
+    pool = PagedKVPool(model.config, sum(num_blocks), block_size)
     num_done = [3, 1, 6]
     prefill = [
-        (row, tokens[:n], 0) for row, tokens, n in zip(rows, sequences, num_done, strict=True)
+        (table, tokens[:n], 0) for table, tokens, n in zip(tables, sequences, num_done, strict=True)
     ]
     logits = [[piece] for piece in flat_step(model, pool, prefill)]
     # Then one token per sequence and step. A sequence leaves the batch once it has used all
     # of its tokens, and the others continue.
     while active := [b for b, tokens in enumerate(sequences) if num_done[b] < len(tokens)]:
         pieces = [
-            (rows[b], sequences[b][num_done[b] : num_done[b] + 1], num_done[b]) for b in active
+            (tables[b], sequences[b][num_done[b] : num_done[b] + 1], num_done[b]) for b in active
         ]
         for b, piece in zip(active, flat_step(model, pool, pieces), strict=True):
             logits[b].append(piece)
@@ -340,10 +352,10 @@ def test_a_step_can_mix_prefill_decode_and_a_prompt_after_a_cached_prefix(
     model: LlamaModel,
 ) -> None:
     first, second, third = flat_sequences(model.config)
-    pool = ContiguousKVPool(model.config, 3, POOL_LEN)
-    before = flat_step(model, pool, [(0, first[:4], 0), (1, third[:2], 0)])
+    pool = one_block_pool(model.config, 3)
+    before = flat_step(model, pool, [([0], first[:4], 0), ([1], third[:2], 0)])
     # First decodes its last token, second starts, third continues after two cached tokens.
-    mixed = flat_step(model, pool, [(0, first[4:], 4), (2, second, 0), (1, third[2:], 2)])
+    mixed = flat_step(model, pool, [([0], first[4:], 4), ([2], second, 0), ([1], third[2:], 2)])
     torch.testing.assert_close(
         torch.cat([before[0], mixed[0]]), alone(model, first), rtol=CACHED_RTOL, atol=CACHED_ATOL
     )
@@ -353,19 +365,26 @@ def test_a_step_can_mix_prefill_decode_and_a_prompt_after_a_cached_prefix(
     )
 
 
+@pytest.mark.parametrize("block_size", [POOL_LEN, 4])
 @torch.inference_mode()
-def test_a_reused_row_ignores_what_its_previous_sequence_left(model: LlamaModel) -> None:
+def test_a_reused_block_ignores_what_its_previous_sequence_left(
+    model: LlamaModel, block_size: int
+) -> None:
     short, _, long = flat_sequences(model.config)
     other = flat_sequences(model.config, seed=1)[2]
-    fresh = ContiguousKVPool(model.config, 2, POOL_LEN)
-    used = ContiguousKVPool(model.config, 2, POOL_LEN)
-    # A longer sequence held row 0 before and ended; its keys and values stay behind.
-    flat_step(model, used, [(0, other, 0)])
-    # A prefill, which gathers the rows, then a decode, which reads them in place up to the
-    # longer sequence, past the shorter one's end into what the old sequence left.
+    num_blocks = -(-len(long) // block_size)
+    tables = [list(range(num_blocks)), list(range(num_blocks, 2 * num_blocks))]
+    fresh = PagedKVPool(model.config, 2 * num_blocks, block_size)
+    used = PagedKVPool(model.config, 2 * num_blocks, block_size)
+    # A longer sequence held the first table's blocks before and ended; its keys and values
+    # stay behind.
+    flat_step(model, used, [(tables[0], other, 0)])
+    # A prefill, which gathers the blocks, then a decode, which reads up to the longer
+    # sequence, past the shorter one's end into what the old sequence left. With blocks of
+    # 12 the decode reads in place, with blocks of 4 it gathers.
     steps = [
-        [(0, short[:-1], 0), (1, long[:-1], 0)],
-        [(0, short[-1:], len(short) - 1), (1, long[-1:], len(long) - 1)],
+        [(tables[0], short[:-1], 0), (tables[1], long[:-1], 0)],
+        [(tables[0], short[-1:], len(short) - 1), (tables[1], long[-1:], len(long) - 1)],
     ]
     assert len(other) > len(short)
     for pieces in steps:
@@ -380,8 +399,8 @@ def test_a_reused_row_ignores_what_its_previous_sequence_left(model: LlamaModel)
 @torch.inference_mode()
 def test_flattened_logits_are_computed_for_the_requested_tokens_only(model: LlamaModel) -> None:
     sequences = flat_sequences(model.config)
-    pool = ContiguousKVPool(model.config, len(sequences), POOL_LEN)
-    metadata = AttentionMetadata.build([0, 1, 2], [0, 0, 0], FLAT_LENGTHS, POOL_LEN)
+    pool = one_block_pool(model.config, len(sequences))
+    metadata = AttentionMetadata.build([[0], [1], [2]], [0, 0, 0], FLAT_LENGTHS, POOL_LEN)
     input_ids = torch.cat(sequences)
     positions = torch.cat([torch.arange(n) for n in FLAT_LENGTHS])
     last_tokens = torch.tensor(FLAT_LENGTHS).cumsum(0) - 1  # [3]

@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch import Tensor
 
-from kiyal.cache.contiguous import ContiguousKVPool
+from kiyal.cache.paged import PagedKVPool
 from kiyal.config import EngineConfig
 from kiyal.engine.generator import TextGenerator
 from kiyal.engine.llm_engine import LLMEngine
@@ -137,7 +137,7 @@ def forward_sizes(
     def record(
         input_ids: Tensor,
         positions: Tensor,
-        pool: ContiguousKVPool,
+        pool: PagedKVPool,
         metadata: AttentionMetadata,
         logits_indices: Tensor,
     ) -> Tensor:
