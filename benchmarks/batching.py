@@ -222,8 +222,20 @@ def time_static(
     return clock.finish(workload)
 
 
-def time_continuous(engine: LLMEngine, workload: Workload, device: torch.device) -> RunTiming:
-    """Adds every request at once and steps the engine until all have ended."""
+def time_continuous(
+    engine: LLMEngine,
+    workload: Workload,
+    device: torch.device,
+    running: list[int] | None = None,
+) -> RunTiming:
+    """Adds every request at once and steps the engine until all have ended.
+
+    Args:
+        engine: The engine, with no unfinished requests.
+        workload: The requests.
+        device: Device of the model, to wait for before reading the clock.
+        running: If given, gets the number of requests in the batch after each step.
+    """
     params = workload.params
     clock = _Clock(len(params), device)
     index = {
@@ -235,6 +247,8 @@ def time_continuous(engine: LLMEngine, workload: Workload, device: torch.device)
         now = clock.elapsed()
         for output in outputs:
             clock.token(index[output.request_id], now, output.finish_reason is not None)
+        if running is not None:
+            running.append(engine.num_running)
     return clock.finish(workload)
 
 

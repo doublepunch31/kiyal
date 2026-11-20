@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from benchmarks import batching, latency, throughput
+from benchmarks import batching, capacity, latency, throughput
 from benchmarks.common import REPO_ROOT, capture_environment, median, percentile, save_result
 from kiyal.config import EngineConfig
 from kiyal.engine.generator import TextGenerator
@@ -401,4 +401,110 @@ def test_batching_main_saves_a_result_file(
     assert [entry["batch_size"] for entry in result["results"]] == [2]
     printed = capsys.readouterr().out
     assert "continuous" in printed
+    assert f"saved {output}" in printed
+
+
+def test_continuous_timing_can_count_the_requests_after_each_step(
+    tiny_model: LlamaModel, tiny_tokenizer: Tokenizer, workload: batching.Workload
+) -> None:
+    engine = LLMEngine(tiny_model, tiny_tokenizer, EngineConfig(max_num_seqs=2))
+    running: list[int] = []
+    batching.time_continuous(engine, workload, CPU, running)
+    assert max(running) == 2
+    assert min(running) >= 1
+
+
+def test_the_contiguous_layout_reserves_the_longest_request_per_sequence(
+    workload: batching.Workload,
+) -> None:
+    config = capacity.engine_config("contiguous", 3 * workload.max_len + 1, workload, 64)
+    assert (config.max_num_seqs, config.num_kv_blocks) == (3, 3)
+    assert config.block_size == config.max_model_len == workload.max_len
+
+
+def test_the_paged_layout_is_limited_by_memory_only(workload: batching.Workload) -> None:
+    config = capacity.engine_config("paged", 100, workload, 64)
+    assert config.block_size == 16
+    assert config.num_kv_blocks == 6
+    assert config.max_num_seqs == len(workload.prompts)
+    assert config.max_model_len == workload.max_len
+
+
+@pytest.mark.parametrize(
+    ("layout", "kv_tokens", "message"),
+    [
+        ("paged", 10, "a budget of 10 tokens cannot hold a request of"),
+        ("rows", 1000, "unknown layout 'rows'"),
+    ],
+)
+def test_invalid_capacity_settings_raise(
+    workload: batching.Workload, layout: str, kv_tokens: int, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        capacity.engine_config(layout, kv_tokens, workload, 64)
+
+
+def test_a_capacity_run_counts_requests_and_preemptions(
+    tiny_model: LlamaModel, tiny_tokenizer: Tokenizer
+) -> None:
+    workload = batching.build_workload(tiny_tokenizer, 8, (4, 12), (20, 30), seed=0)
+    # Room for two of the longest requests, in blocks: all eight prompts fit at the start,
+    # and their outputs do not.
+    config = capacity.engine_config("paged", 2 * workload.max_len, workload, 64)
+    engine = LLMEngine(tiny_model, tiny_tokenizer, config)
+    first = capacity.run_once(engine, workload, CPU)
+    assert first["peak_running"] > 2
+    assert 1 <= first["mean_running"] <= first["peak_running"]
+    assert first["preemptions"] > 0
+    # Preemptions are counted per run, not since the engine started.
+    second = capacity.run_once(engine, workload, CPU)
+    assert second["preemptions"] == first["preemptions"]
+
+
+def test_capacity_measures_both_layouts_at_each_budget(
+    tiny_model: LlamaModel, tiny_tokenizer: Tokenizer
+) -> None:
+    settings = capacity.Settings(
+        num_requests=4,
+        prompt_tokens=(4, 8),
+        output_tokens=(2, 6),
+        seed=0,
+        kv_tokens=(32, 64),
+        max_num_batched_tokens=32,
+        repeats=2,
+        warmup=1,
+    )
+    workload, results = capacity.measure(tiny_model, tiny_tokenizer, settings, CPU)
+    assert len(workload.prompts) == 4
+    assert [entry["kv_tokens"] for entry in results] == [32, 64]
+    # 2 layers, keys and values, 2 KV heads of 16 dimensions, 4 bytes each.
+    assert [entry["kv_bytes"] for entry in results] == [32 * 512, 64 * 512]
+    for entry, kv_tokens in zip(results, settings.kv_tokens, strict=True):
+        layouts = entry["layouts"]
+        assert isinstance(layouts, dict)
+        assert list(layouts) == ["contiguous", "paged"]
+        assert layouts["contiguous"]["max_num_seqs"] == kv_tokens // workload.max_len
+        assert layouts["paged"]["num_kv_blocks"] == kv_tokens // 16
+        for summary in layouts.values():
+            assert len(summary["runs"]) == 2
+            assert summary["median"]["total_s"] == median([r["total_s"] for r in summary["runs"]])
+
+
+def test_capacity_main_saves_a_result_file(
+    tiny_model_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "capacity.json"
+    options = ["--device", "cpu", "--dtype", "fp32", "--num-requests", "4", "--repeats", "1"]
+    lengths = ["--prompt-tokens", "4", "8", "--output-tokens", "2", "6", "--warmup", "0"]
+    args = ["--model", str(tiny_model_dir), *options, *lengths, "--kv-tokens", "48"]
+    assert capacity.main([*args, "--output", str(output)]) == 0
+
+    result = json.loads(output.read_text())
+    assert result["benchmark"] == "capacity"
+    assert (result["prompt_tokens"], result["output_tokens"]) == ([4, 8], [2, 6])
+    assert (result["num_requests"], result["seed"], result["repeats"]) == (4, 0, 1)
+    assert 6 <= result["max_len"] <= 14
+    assert [entry["kv_tokens"] for entry in result["results"]] == [48]
+    printed = capsys.readouterr().out
+    assert "paged" in printed
     assert f"saved {output}" in printed

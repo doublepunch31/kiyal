@@ -1,7 +1,7 @@
 """Renders benchmark results as a chart (PNG) and a table (markdown).
 
-Run from the repository root, with the latency results of both engines, one throughput
-result or one batching result:
+Run from the repository root, with the latency results of both engines, or one throughput,
+batching or capacity result:
 
     uv run python -m benchmarks.plot latency benchmarks/results/latency-*-cpu.json \
         --output benchmarks/results/latency-cpu
@@ -9,6 +9,8 @@ result or one batching result:
         --output benchmarks/results/throughput-cpu
     uv run python -m benchmarks.plot batching benchmarks/results/batching-cpu.json \
         --output benchmarks/results/batching-cpu
+    uv run python -m benchmarks.plot capacity benchmarks/results/capacity-cpu.json \
+        --output benchmarks/results/capacity-cpu
 """
 
 import argparse
@@ -31,6 +33,10 @@ ENGINE_LABELS = {"cached": "KV cache", "naive": "naive (no cache)"}
 STATIC_COLOR = ENGINE_COLORS["cached"]
 BATCHING_COLORS = {"static": STATIC_COLOR, "continuous": "#1baf7a"}
 BATCHING_LABELS = {"static": "static batching", "continuous": "continuous batching"}
+# The contiguous pool is continuous batching's pool before paging, so it keeps that color. The
+# paged pool takes the next hue of the palette.
+CAPACITY_COLORS = {"contiguous": BATCHING_COLORS["continuous"], "paged": "#eda100"}
+CAPACITY_LABELS = {"contiguous": "contiguous", "paged": "paged"}
 SURFACE = "#fcfcfb"
 TEXT = "#0b0b0b"
 MUTED_TEXT = "#52514e"
@@ -404,6 +410,125 @@ def plot_batching(result: Result, path: Path) -> Path:
     return path
 
 
+def load_capacity_result(path: Path) -> Result:
+    """Reads a capacity result file.
+
+    Raises:
+        ValueError: If the file is not a capacity result.
+    """
+    result = json.loads(path.read_text())
+    if result.get("benchmark") != "capacity":
+        raise ValueError(f"{path} is not a capacity result")
+    return result
+
+
+def layout_medians(result: Result, layout: str, metric: str) -> dict[int, float]:
+    """Returns the median of a metric for each KV budget of one layout in a capacity result."""
+    return {
+        entry["kv_tokens"]: entry["layouts"][layout]["median"][metric]
+        for entry in result["results"]
+    }
+
+
+def capacity_table(result: Result) -> str:
+    """Renders a capacity result as a markdown table with one row per KV budget.
+
+    "requests" counts those holding KV memory after a step: the most at once and the mean
+    over steps.
+    """
+    header = [
+        "KV tokens",
+        "KV MB",
+        "contiguous requests",
+        "paged most requests",
+        "contiguous mean requests",
+        "paged mean requests",
+        "paged preemptions",
+        "contiguous tokens/s",
+        "paged tokens/s",
+        "throughput x",
+        "contiguous p99 E2E s",
+        "paged p99 E2E s",
+    ]
+    lines = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
+    for entry in sorted(result["results"], key=lambda e: e["kv_tokens"]):
+        contiguous = entry["layouts"]["contiguous"]["median"]
+        paged = entry["layouts"]["paged"]["median"]
+        row = [
+            str(entry["kv_tokens"]),
+            f"{entry['kv_bytes'] / 2**20:.0f}",
+            f"{contiguous['peak_running']:.0f}",
+            f"{paged['peak_running']:.0f}",
+            f"{contiguous['mean_running']:.1f}",
+            f"{paged['mean_running']:.1f}",
+            f"{paged['preemptions']:.0f}",
+            f"{contiguous['output_tokens_per_s']:.1f}",
+            f"{paged['output_tokens_per_s']:.1f}",
+            f"{paged['output_tokens_per_s'] / contiguous['output_tokens_per_s']:.2f}",
+            f"{contiguous['e2e_p99_s']:.2f}",
+            f"{paged['e2e_p99_s']:.2f}",
+        ]
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def plot_capacity(result: Result, path: Path) -> Path:
+    """Draws the requests that hold KV memory and the throughput against the KV budget."""
+    figure = Figure(figsize=(10.5, 4.6), dpi=160, facecolor=SURFACE)
+    seqs_axes, speed_axes = figure.subplots(1, 2)
+    budgets = sorted(entry["kv_tokens"] for entry in result["results"])
+    end_labels: list[tuple[int, float, str]] = []
+
+    for layout, color in CAPACITY_COLORS.items():
+        label = CAPACITY_LABELS[layout]
+        mean = layout_medians(result, layout, "mean_running")
+        peak = layout_medians(result, layout, "peak_running")
+        _draw_series(seqs_axes, mean, color, f"{label}, mean over steps", None)
+        end_labels.append((budgets[-1], mean[budgets[-1]], f"{mean[budgets[-1]]:.1f}"))
+        # The most at once in the same color, told apart by dashes without markers.
+        most = _draw_series(seqs_axes, peak, color, f"{label}, most at once", None)
+        most.set_linestyle("--")
+        most.set_marker("")
+        speeds = layout_medians(result, layout, "output_tokens_per_s")
+        _draw_series(speed_axes, speeds, color, label, f"{speeds[budgets[-1]]:,.0f}")
+
+    _style_axes(seqs_axes, budgets, "Requests holding KV memory", "KV memory budget in tokens")
+    seqs_axes.set_ylim(bottom=0)
+    _spread_end_labels(seqs_axes, end_labels)
+    seqs_axes.text(
+        0.0, 1.03,
+        f"contiguous: a row of {result['max_len']} tokens per request, "
+        f"paged: blocks of {result['results'][0]['layouts']['paged']['block_size']}",
+        transform=seqs_axes.transAxes, color=MUTED_TEXT, fontsize=9, va="bottom",
+    )  # fmt: skip
+    # Long handles, so that the dashes show in the legend.
+    seqs_axes.legend(frameon=False, labelcolor=TEXT, loc="upper left", fontsize=8, handlelength=3.5)
+    _style_axes(speed_axes, budgets, "Output tokens per second", "KV memory budget in tokens")
+    speed_axes.set_ylim(bottom=0)
+    speed_axes.legend(frameon=False, labelcolor=TEXT, loc="upper left", fontsize=9)
+    # The gain in numbers at each end of the range.
+    contiguous = layout_medians(result, "contiguous", "output_tokens_per_s")
+    paged = layout_medians(result, "paged", "output_tokens_per_s")
+    gains = [
+        f"{budget} tokens: x{paged[budget] / contiguous[budget]:.2f}"
+        for budget in (budgets[0], budgets[-1])
+    ]
+    speed_axes.text(
+        0.0, 1.03, "paged over contiguous, " + ", ".join(dict.fromkeys(gains)),
+        transform=speed_axes.transAxes, color=MUTED_TEXT, fontsize=9, va="bottom",
+    )  # fmt: skip
+
+    figure.suptitle(
+        "Contiguous against paged KV memory under the same budget",
+        x=0.06, y=0.97, ha="left", color=TEXT, fontsize=13, fontweight="bold",
+    )  # fmt: skip
+    figure.text(0.06, 0.885, describe_batching(result), color=MUTED_TEXT, fontsize=9)
+    figure.subplots_adjust(left=0.06, right=0.97, top=0.74, bottom=0.12, wspace=0.16)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path)
+    return path
+
+
 def _draw_series(
     axes: Axes, values: dict[int, float], color: str, label: str, end_label: str | None
 ) -> Line2D:
@@ -504,6 +629,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     batching.add_argument(
         "--output", type=Path, required=True, help="path of the chart and table, without suffix"
     )
+    capacity = commands.add_parser("capacity", help="contiguous against paged KV memory")
+    capacity.add_argument("result", type=Path, help="capacity result file")
+    capacity.add_argument(
+        "--output", type=Path, required=True, help="path of the chart and table, without suffix"
+    )
     args = parser.parse_args(argv)
 
     chart = args.output.with_name(args.output.name + ".png")
@@ -516,10 +646,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = load_throughput_result(args.result)
         plot_throughput(result, chart)
         table.write_text(f"{describe({'static': result})}\n\n{throughput_table(result)}")
-    else:
+    elif args.command == "batching":
         result = load_batching_result(args.result)
         plot_batching(result, chart)
         table.write_text(f"{describe_batching(result)}\n\n{batching_table(result)}")
+    else:
+        result = load_capacity_result(args.result)
+        plot_capacity(result, chart)
+        table.write_text(f"{describe_batching(result)}\n\n{capacity_table(result)}")
     print(f"saved {chart}")
     print(f"saved {table}")
     return 0

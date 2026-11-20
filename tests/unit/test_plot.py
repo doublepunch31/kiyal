@@ -334,3 +334,80 @@ def test_end_labels_that_would_overlap_are_moved_apart() -> None:
     assert heights["b"] - heights["a"] >= 12
     # A label with room stays next to its line end.
     assert heights["c"] == pytest.approx(axes.transData.transform((1, 80.0))[1] * to_points, abs=8)
+
+
+def capacity_result(layouts: dict[int, tuple[float, float]]) -> plot.Result:
+    """A capacity result in the shape that benchmarks.capacity saves.
+
+    Args:
+        layouts: Contiguous and paged output tokens/s per KV budget. The other metrics are
+            derived from them so that each value is distinct.
+    """
+
+    def summary(speed: float, kv_tokens: int, paged: bool) -> dict[str, float]:
+        return {
+            "output_tokens_per_s": speed,
+            "e2e_p99_s": 1000 / speed,
+            "peak_running": kv_tokens / (64 if paged else 256),
+            "mean_running": kv_tokens / (100 if paged else 300),
+            "preemptions": 5.0 if paged else 0.0,
+        }
+
+    return {
+        **batching_result({}),
+        "benchmark": "capacity",
+        "max_len": 256,
+        "results": [
+            {
+                "kv_tokens": kv_tokens,
+                "kv_bytes": kv_tokens * 2**10,
+                "layouts": {
+                    "contiguous": {
+                        "block_size": 256,
+                        "median": summary(contiguous, kv_tokens, False),
+                    },
+                    "paged": {"block_size": 16, "median": summary(paged, kv_tokens, True)},
+                },
+            }
+            for kv_tokens, (contiguous, paged) in layouts.items()
+        ],
+    }
+
+
+@pytest.fixture
+def layouts() -> plot.Result:
+    return capacity_result({2048: (100.0, 150.0), 4096: (200.0, 250.0)})
+
+
+def test_a_capacity_result_is_loaded(tmp_path: Path, layouts: plot.Result) -> None:
+    assert plot.load_capacity_result(write(tmp_path / "c.json", layouts)) == layouts
+    with pytest.raises(ValueError, match="not a capacity result"):
+        plot.load_capacity_result(write(tmp_path / "b.json", batching_result({})))
+
+
+def test_the_capacity_table_compares_the_layouts_at_each_budget(layouts: plot.Result) -> None:
+    lines = plot.capacity_table(layouts).splitlines()
+    assert lines[0] == (
+        "| KV tokens | KV MB | contiguous requests | paged most requests | "
+        "contiguous mean requests | paged mean requests | paged preemptions | "
+        "contiguous tokens/s | paged tokens/s | throughput x | contiguous p99 E2E s | "
+        "paged p99 E2E s |"
+    )
+    assert lines[2:] == [
+        "| 2048 | 2 | 8 | 32 | 6.8 | 20.5 | 5 | 100.0 | 150.0 | 1.50 | 10.00 | 6.67 |",
+        "| 4096 | 4 | 16 | 64 | 13.7 | 41.0 | 5 | 200.0 | 250.0 | 1.25 | 5.00 | 4.00 |",
+    ]
+
+
+def test_main_writes_the_capacity_chart_and_table(
+    tmp_path: Path, layouts: plot.Result, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "capacity-cpu"
+    path = write(tmp_path / "c.json", layouts)
+    assert plot.main(["capacity", str(path), "--output", str(output)]) == 0
+    chart, table = output.with_name("capacity-cpu.png"), output.with_name("capacity-cpu.md")
+    assert chart.read_bytes().startswith(PNG_SIGNATURE)
+    assert (
+        table.read_text() == f"{plot.describe_batching(layouts)}\n\n{plot.capacity_table(layouts)}"
+    )
+    assert capsys.readouterr().out == f"saved {chart}\nsaved {table}\n"
