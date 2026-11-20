@@ -6,7 +6,7 @@ import torch
 
 from kiyal.cache.block_manager import BlockManager
 from kiyal.config import EngineConfig
-from kiyal.engine.model_runner import ModelRunner
+from kiyal.engine.model_runner import ModelRunner, kv_blocks_for_memory
 from kiyal.engine.scheduler import Scheduler
 from kiyal.engine.sequence import (
     FinishReason,
@@ -54,7 +54,9 @@ class LLMEngine:
             model: The model to generate with.
             tokenizer: The model's tokenizer.
             config: Batch limits; the defaults of EngineConfig when None. `max_model_len`
-                is lowered to the model's context if that is shorter.
+                is lowered to the model's context if that is shorter. Without
+                `num_kv_blocks`, the KV pool is sized from memory, which on CUDA runs one
+                forward pass of the largest step to measure the memory it needs.
 
         Raises:
             ValueError: If the tokenizer has more tokens than the model, or the KV pool
@@ -66,14 +68,18 @@ class LLMEngine:
         blocks_per_seq = -(-max_len // config.block_size)
         num_blocks = config.num_kv_blocks
         if num_blocks is None:
-            num_blocks = config.max_num_seqs * blocks_per_seq
+            # Never more than the batch can use.
+            num_blocks = min(
+                config.max_num_seqs * blocks_per_seq, kv_blocks_for_memory(model, config, max_len)
+            )
         watermark = int(config.watermark * num_blocks)
         # Otherwise a sequence could grow to where it does not fit even alone, and would be
         # preempted and restarted forever.
         if num_blocks - watermark < blocks_per_seq:
             raise ValueError(
                 f"a KV pool of {num_blocks} x {config.block_size} tokens with a watermark of "
-                f"{watermark} blocks cannot hold one sequence of {max_len} tokens"
+                f"{watermark} blocks cannot hold one sequence of {max_len} tokens; give the "
+                f"pool more blocks or memory, or lower max_model_len"
             )
         self._runner = ModelRunner(model, num_blocks, config.block_size)
         self._scheduler = Scheduler(config, BlockManager(num_blocks, config.block_size, watermark))
@@ -135,6 +141,11 @@ class LLMEngine:
     def num_running(self) -> int:
         """Requests in the batch, including those that finished at the last step."""
         return self._scheduler.num_running
+
+    @property
+    def num_kv_blocks(self) -> int:
+        """Blocks of the KV pool."""
+        return self._runner.pool.num_blocks
 
     @property
     def num_preemptions(self) -> int:

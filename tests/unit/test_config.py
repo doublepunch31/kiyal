@@ -32,3 +32,14 @@ def test_the_default_pool_size_is_left_to_the_engine() -> None:
 def test_a_watermark_outside_0_to_1_raises(watermark: float) -> None:
     with pytest.raises(ValueError, match=r"watermark must be in \[0, 1\)"):
         EngineConfig(watermark=watermark)
+
+
+@pytest.mark.parametrize("utilization", [0.0, 1.5])
+def test_a_gpu_memory_utilization_outside_0_to_1_raises(utilization: float) -> None:
+    with pytest.raises(ValueError, match=r"gpu_memory_utilization must be in \(0, 1\]"):
+        EngineConfig(gpu_memory_utilization=utilization)
+
+
+def test_an_empty_kv_cache_raises() -> None:
+    with pytest.raises(ValueError, match="kv_cache_gb must be above 0"):
+        EngineConfig(kv_cache_gb=0.0)
