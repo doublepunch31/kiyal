@@ -2,6 +2,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
+from kiyal.cache.block_manager import BlockManager
 from kiyal.config import EngineConfig
 from kiyal.engine.sequence import FinishReason, Sequence, SequenceStatus
 
@@ -11,7 +12,8 @@ class SchedulerOutput:
     """The sequences that one engine step runs through the model.
 
     Attributes:
-        prefills: Sequences that start in this step; the model runs on their prompts.
+        prefills: Sequences that start in this step; the model runs on their prompts, and
+            on their outputs so far if they were preempted.
         decodes: Running sequences that get one more token in this step.
     """
 
@@ -44,20 +46,30 @@ class Scheduler:
       waiting sequences fit, the step starts them, and the running ones wait for one step.
       This keeps each forward pass uniform. The price is a pause in every running output
       while prompts run; chunked prefill, which mixes both, would remove it.
-    - Two budgets bound a step: `max_num_seqs` sequences in the batch (one KV pool row
-      each) and `max_num_batched_tokens` prompt tokens started together.
+    - Three budgets bound a step: `max_num_seqs` sequences in the batch,
+      `max_num_batched_tokens` prompt tokens started together, and the free KV blocks. A
+      sequence starts only if blocks for all its tokens are free beyond the watermark.
+    - Preemption by recompute. A decode step needs room for one more token of every running
+      sequence. When the free blocks run out, the most recently arrived running sequence
+      gives up its blocks and goes back to the front of the waiting queue. When it starts
+      again, its prompt and its output so far run as one prefill, which computes the lost
+      keys and values again. At these model sizes that is cheaper than copying the blocks
+      to host memory and back, and it needs no second pool.
 
-    The scheduler hands out pool rows and takes them back. It never runs the model and
+    The scheduler hands out KV blocks and takes them back. It never runs the model and
     does not add tokens; the engine does both and reports finished sequences through their
     status.
     """
 
-    def __init__(self, config: EngineConfig) -> None:
+    def __init__(self, config: EngineConfig, block_manager: BlockManager) -> None:
         self._config = config
+        self._blocks = block_manager
         self._waiting: deque[Sequence] = deque()
+        # In arrival order, so the newest is preempted first. Admissions keep the order:
+        # a preempted sequence goes back to the front of the waiting queue, and nothing
+        # behind it starts before it does.
         self._running: list[Sequence] = []
-        # A stack whose top is row 0, so rows are handed out in order.
-        self._free_rows = list(reversed(range(config.max_num_seqs)))
+        self._num_preemptions = 0
 
     @property
     def num_waiting(self) -> int:
@@ -66,6 +78,11 @@ class Scheduler:
     @property
     def num_running(self) -> int:
         return len(self._running)
+
+    @property
+    def num_preemptions(self) -> int:
+        """Times a running sequence has given up its blocks so far."""
+        return self._num_preemptions
 
     def has_unfinished(self) -> bool:
         return bool(self._waiting) or any(not seq.is_finished for seq in self._running)
@@ -90,35 +107,21 @@ class Scheduler:
     def schedule(self) -> SchedulerOutput:
         """Picks the sequences of the next step.
 
-        Sequences that finished since the last step leave the batch first, and their pool
-        rows become free.
+        Sequences that finished since the last step leave the batch first, and their KV
+        blocks become free.
 
         Returns:
             Prefills if a waiting sequence fits, otherwise a decode of every running
-            sequence. Empty when nothing is left to run.
+            sequence that keeps its blocks. Empty when nothing is left to run.
         """
         self._release_finished()
-        prefills: list[Sequence] = []
-        budget = self._config.max_num_batched_tokens
-        # A free row means the batch is below max_num_seqs.
-        while self._waiting and self._free_rows:
-            seq = self._waiting[0]
-            num_tokens = seq.num_tokens - seq.num_computed_tokens
-            if num_tokens > budget:
-                break
-            self._waiting.popleft()
-            seq.cache_row = self._free_rows.pop()
-            seq.status = SequenceStatus.RUNNING
-            seq.first_scheduled_time = time.perf_counter()
-            self._running.append(seq)
-            prefills.append(seq)
-            budget -= num_tokens
+        prefills = self._admit()
         if prefills:
             return SchedulerOutput(prefills=prefills, decodes=[])
-        return SchedulerOutput(prefills=[], decodes=list(self._running))
+        return SchedulerOutput(prefills=[], decodes=self._grow_running())
 
     def abort(self, request_id: str) -> Sequence | None:
-        """Ends a waiting or running request at once and frees its pool row.
+        """Ends a waiting or running request at once and frees its KV blocks.
 
         Returns:
             The aborted sequence, or None if no unfinished request has this id, for example
@@ -136,13 +139,69 @@ class Scheduler:
                 return seq
         return None
 
+    def _admit(self) -> list[Sequence]:
+        """Starts waiting sequences in order while they fit, and returns them."""
+        prefills: list[Sequence] = []
+        budget = self._config.max_num_batched_tokens
+        while self._waiting and len(self._running) < self._config.max_num_seqs:
+            seq = self._waiting[0]
+            num_tokens = seq.num_tokens - seq.num_computed_tokens
+            # Only a preempted sequence can be longer than the whole budget, since it
+            # reruns its output too. It starts alone: without chunked prefill it could
+            # never start otherwise.
+            if num_tokens > budget and prefills:
+                break
+            if not self._blocks.can_allocate(seq.num_tokens):
+                break
+            self._waiting.popleft()
+            seq.block_table = self._blocks.allocate(seq.num_tokens)
+            seq.status = SequenceStatus.RUNNING
+            if seq.first_scheduled_time is None:
+                seq.first_scheduled_time = time.perf_counter()
+            self._running.append(seq)
+            prefills.append(seq)
+            budget -= num_tokens
+        return prefills
+
+    def _grow_running(self) -> list[Sequence]:
+        """Makes room for one more token of every running sequence, oldest first.
+
+        When the free blocks run out, the newest running sequences are preempted until the
+        older ones fit; a sequence that still does not fit is preempted itself.
+
+        Returns:
+            The running sequences that keep their blocks, in arrival order.
+        """
+        queue = deque(self._running)
+        kept: list[Sequence] = []
+        while queue:
+            seq = queue.popleft()
+            # The step writes the token added at the last step, so the table must hold
+            # every token of the sequence.
+            while queue and not self._blocks.can_append(seq.block_table, seq.num_tokens):
+                self._preempt(queue.pop())
+            if self._blocks.can_append(seq.block_table, seq.num_tokens):
+                self._blocks.append_slot(seq.block_table, seq.num_tokens)
+                kept.append(seq)
+            else:
+                self._preempt(seq)
+        self._running = kept
+        return list(kept)
+
+    def _preempt(self, seq: Sequence) -> None:
+        self._blocks.free(seq.block_table)
+        seq.num_computed_tokens = 0
+        seq.status = SequenceStatus.PREEMPTED
+        # Ahead of the sequences that arrived later. Of several preempted in one step, the
+        # newest goes first and so ends up behind the others.
+        self._waiting.appendleft(seq)
+        self._num_preemptions += 1
+
     def _release_finished(self) -> None:
         still_running: list[Sequence] = []
         for seq in self._running:
             if seq.is_finished:
-                assert seq.cache_row is not None
-                self._free_rows.append(seq.cache_row)
-                seq.cache_row = None
+                self._blocks.free(seq.block_table)
             else:
                 still_running.append(seq)
         self._running = still_running

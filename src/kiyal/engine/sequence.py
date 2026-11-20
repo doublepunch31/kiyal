@@ -33,8 +33,11 @@ class SequenceStatus(Enum):
 
     # Added, and waiting for room in the batch.
     WAITING = "waiting"
-    # In the batch, with a row of the KV pool, until its output ends.
+    # In the batch, with blocks of the KV pool, until its output ends.
     RUNNING = "running"
+    # Sent back to the waiting queue after giving up its KV blocks. Its keys and values are
+    # computed again when it starts again.
+    PREEMPTED = "preempted"
     FINISHED = "finished"
 
 
@@ -130,10 +133,12 @@ class Sequence:
         status: Where the sequence is in the engine.
         finish_reason: Why the output ended, None until it has.
         num_computed_tokens: Tokens whose keys and values are in the KV cache.
-        cache_row: Row of the KV pool while the sequence runs, None otherwise.
+        block_table: Blocks of the KV pool that hold the sequence's tokens, in order, while
+            it runs. Empty otherwise.
         arrival_time: When the request was added, from `time.perf_counter()`, like the
             other times.
-        first_scheduled_time: When the sequence first entered the batch.
+        first_scheduled_time: When the sequence first entered the batch, not counting
+            restarts after preemption.
         first_token_time: When its first output token was added.
         last_token_time: When its latest output token was added.
         finished_time: When its output ended.
@@ -150,7 +155,7 @@ class Sequence:
     status: SequenceStatus = SequenceStatus.WAITING
     finish_reason: FinishReason | None = None
     num_computed_tokens: int = 0
-    cache_row: int | None = None
+    block_table: list[int] = field(default_factory=list[int])
     arrival_time: float = field(default_factory=time.perf_counter)
     first_scheduled_time: float | None = None
     first_token_time: float | None = None
@@ -170,6 +175,7 @@ class Sequence:
         """Tokens whose keys and values are not in the KV cache yet, in order.
 
         That is the prompt before the sequence first runs, then the latest output token.
+        After a preemption it is the prompt and the whole output again.
         """
         num_prompt = len(self.prompt_token_ids)
         if self.num_computed_tokens < num_prompt:

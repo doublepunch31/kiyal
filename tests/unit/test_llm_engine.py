@@ -4,6 +4,7 @@ import pytest
 import torch
 from torch import Tensor
 
+from kiyal.cache.block_manager import BlockManager
 from kiyal.cache.paged import PagedKVPool
 from kiyal.config import EngineConfig
 from kiyal.engine.generator import TextGenerator
@@ -47,10 +48,12 @@ def test_the_runner_returns_each_sequences_next_token_logits(
     model: LlamaModel, tiny_tokenizer: Tokenizer, prompts: list[list[int]]
 ) -> None:
     factory = SequenceFactory(model.config, tiny_tokenizer, 32)
-    runner = ModelRunner(model, num_rows=4, max_len=32)
+    runner = ModelRunner(model, num_blocks=32, block_size=4)
+    blocks = BlockManager(num_blocks=32, block_size=4)
     sequences = [factory.create(str(i), prompt, GREEDY) for i, prompt in enumerate(prompts)]
-    for row, seq in zip([3, 1, 0, 2], sequences, strict=True):
-        seq.cache_row = row
+    # The last sequence gets the lowest blocks, so blocks and sequences are in other orders.
+    for seq in reversed(sequences):
+        seq.block_table = blocks.allocate(seq.num_tokens)
     logits = runner.execute(sequences)
     assert logits.shape == (len(prompts), model.config.vocab_size)
     with torch.inference_mode():
@@ -112,6 +115,46 @@ def test_a_finished_request_leaves_the_batch(engine: LLMEngine, prompts: list[li
         (long, None),
     ]
     assert [o.request_id for o in engine.step()] == [long]
+
+
+def test_requests_that_outgrow_the_pool_generate_what_they_generate_alone(
+    model: LlamaModel, tiny_tokenizer: Tokenizer, prompts: list[list[int]]
+) -> None:
+    # Blocks of 4 for 12 sequences of 32 tokens fit the 4 requests at the start. The pool
+    # cannot fit their outputs at once, so the newest ones give up their blocks and are
+    # computed again.
+    config = EngineConfig(max_num_seqs=4, max_model_len=32, block_size=4, num_kv_blocks=12)
+    engine = LLMEngine(model, tiny_tokenizer, config)
+    params = SamplingParams(max_tokens=16, temperature=0, ignore_eos=True)
+    alone = [engine.generate([prompt], [params])[0] for prompt in prompts]
+    assert engine.num_preemptions == 0
+    together = engine.generate(prompts, [params] * len(prompts))
+    assert engine.num_preemptions > 0
+    assert [c.token_ids for c in together] == [c.token_ids for c in alone]
+    assert [c.text for c in together] == [c.text for c in alone]
+
+
+def test_the_engine_counts_the_requests_in_the_batch(
+    engine: LLMEngine, prompts: list[list[int]]
+) -> None:
+    assert engine.num_running == 0
+    engine.add_request(prompts[0], GREEDY)
+    engine.add_request(prompts[1], GREEDY)
+    engine.step()
+    assert engine.num_running == 2
+
+
+def test_a_pool_that_cannot_hold_one_sequence_raises(
+    model: LlamaModel, tiny_tokenizer: Tokenizer
+) -> None:
+    # 32 tokens take 2 blocks of 16, and the watermark holds one of 3 back.
+    LLMEngine(model, tiny_tokenizer, EngineConfig(max_model_len=32, num_kv_blocks=2))
+    config = EngineConfig(max_model_len=32, num_kv_blocks=1)
+    with pytest.raises(ValueError, match="pool of 1 x 16 tokens with a watermark of 0 blocks"):
+        LLMEngine(model, tiny_tokenizer, config)
+    config = EngineConfig(max_model_len=32, num_kv_blocks=2, watermark=0.5)
+    with pytest.raises(ValueError, match="cannot hold one sequence of 32 tokens"):
+        LLMEngine(model, tiny_tokenizer, config)
 
 
 def test_a_waiting_request_starts_when_a_running_one_ends(

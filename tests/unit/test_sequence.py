@@ -92,7 +92,7 @@ def test_a_new_sequence_waits_with_nothing_computed(factory: SequenceFactory) ->
     seq = factory.create("a", [5, 6, 7], SamplingParams(max_tokens=4))
     assert seq.request_id == "a"
     assert seq.status is SequenceStatus.WAITING
-    assert (seq.num_tokens, seq.num_computed_tokens, seq.cache_row) == (3, 0, None)
+    assert (seq.num_tokens, seq.num_computed_tokens, seq.block_table) == (3, 0, [])
     assert seq.uncomputed_token_ids() == [5, 6, 7]
     assert seq.finish_reason is None
     assert seq.generator is None

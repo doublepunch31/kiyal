@@ -15,21 +15,20 @@ class ModelRunner:
     tokens to compute logits for.
     """
 
-    def __init__(self, model: LlamaModel, num_rows: int, max_len: int) -> None:
-        """Allocates a KV pool of `num_rows` rows of `max_len` positions.
+    def __init__(self, model: LlamaModel, num_blocks: int, block_size: int) -> None:
+        """Allocates a KV pool of `num_blocks` blocks of `block_size` positions.
 
         Args:
             model: The model to run.
-            num_rows: Rows of the pool, one per sequence in the batch.
-            max_len: Positions per row, the most tokens one sequence can hold.
+            num_blocks: Blocks of the pool, shared by all sequences.
+            block_size: Positions per block.
         """
         self._model = model
         self._device = model.embed_tokens.weight.device
-        # One block per row, as long as the longest sequence.
         self.pool = PagedKVPool(
             model.config,
-            num_rows,
-            max_len,
+            num_blocks,
+            block_size,
             device=self._device,
             dtype=model.embed_tokens.weight.dtype,
         )
@@ -38,8 +37,9 @@ class ModelRunner:
     def execute(self, sequences: list[Sequence]) -> Tensor:
         """Runs every sequence's uncomputed tokens and returns its next-token logits.
 
-        Each sequence must hold a pool row. The keys and values of the tokens run here are
-        written to it; updating `num_computed_tokens` is left to the caller.
+        Each sequence's block table must have room for all its tokens. The keys and values
+        of the tokens run here are written to its blocks; updating `num_computed_tokens` is
+        left to the caller.
 
         Returns:
             [B, V] logits, one row per sequence, in order.
@@ -51,12 +51,11 @@ class ModelRunner:
         num_new: list[int] = []
         logits_indices: list[int] = []
         for seq in sequences:
-            assert seq.cache_row is not None, f"request {seq.request_id} has no pool row"
             new_token_ids = seq.uncomputed_token_ids()
             start = seq.num_computed_tokens
             token_ids += new_token_ids
             positions += range(start, start + len(new_token_ids))
-            block_tables.append([seq.cache_row])
+            block_tables.append(seq.block_table)
             num_cached.append(start)
             num_new.append(len(new_token_ids))
             # Only the last new token predicts the next one.

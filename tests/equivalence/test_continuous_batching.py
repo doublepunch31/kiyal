@@ -7,6 +7,7 @@ import pytest
 import torch
 from torch import Tensor
 
+from kiyal.cache.block_manager import BlockManager
 from kiyal.config import EngineConfig
 from kiyal.engine.generator import TextGenerator
 from kiyal.engine.llm_engine import LLMEngine
@@ -81,8 +82,10 @@ def continuous_logits(
     model, config = setup.model, setup.config
     max_len = model.config.max_position_embeddings
     factory = SequenceFactory(model.config, setup.tokenizer, max_len)
-    scheduler = Scheduler(config)
-    runner = ModelRunner(model, config.max_num_seqs, max_len)
+    blocks_per_seq = -(-max_len // config.block_size)
+    num_blocks = config.max_num_seqs * blocks_per_seq
+    scheduler = Scheduler(config, BlockManager(num_blocks, config.block_size))
+    runner = ModelRunner(model, num_blocks, config.block_size)
     sequences = [
         factory.create(str(index), prompt, SamplingParams(max_tokens=len(tokens), ignore_eos=True))
         for index, (prompt, tokens) in enumerate(zip(prompts, forced_tokens, strict=True))

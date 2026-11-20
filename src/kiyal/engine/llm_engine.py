@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
+from kiyal.cache.block_manager import BlockManager
 from kiyal.config import EngineConfig
 from kiyal.engine.model_runner import ModelRunner
 from kiyal.engine.scheduler import Scheduler
@@ -39,7 +40,9 @@ class LLMEngine:
     that has already ended, and a new request need not wait for a whole batch to finish.
 
     The tokens of all requests in a step go through the model flattened, one after
-    another, so no compute goes to padding outside attention.
+    another, so no compute goes to padding outside attention. Their keys and values live in
+    a paged pool: each request takes blocks as its output grows, and when the blocks run
+    out, the newest request gives its blocks up and is computed again later.
     """
 
     def __init__(
@@ -54,13 +57,26 @@ class LLMEngine:
                 is lowered to the model's context if that is shorter.
 
         Raises:
-            ValueError: If the tokenizer has more tokens than the model.
+            ValueError: If the tokenizer has more tokens than the model, or the KV pool
+                cannot hold one sequence of `max_model_len` tokens next to the watermark.
         """
         config = EngineConfig() if config is None else config
         max_len = min(config.max_model_len, model.config.max_position_embeddings)
         self._sequences = SequenceFactory(model.config, tokenizer, max_len)
-        self._scheduler = Scheduler(config)
-        self._runner = ModelRunner(model, config.max_num_seqs, max_len)
+        blocks_per_seq = -(-max_len // config.block_size)
+        num_blocks = config.num_kv_blocks
+        if num_blocks is None:
+            num_blocks = config.max_num_seqs * blocks_per_seq
+        watermark = int(config.watermark * num_blocks)
+        # Otherwise a sequence could grow to where it does not fit even alone, and would be
+        # preempted and restarted forever.
+        if num_blocks - watermark < blocks_per_seq:
+            raise ValueError(
+                f"a KV pool of {num_blocks} x {config.block_size} tokens with a watermark of "
+                f"{watermark} blocks cannot hold one sequence of {max_len} tokens"
+            )
+        self._runner = ModelRunner(model, num_blocks, config.block_size)
+        self._scheduler = Scheduler(config, BlockManager(num_blocks, config.block_size, watermark))
         self._vocab_size = model.config.vocab_size
         self._device = model.embed_tokens.weight.device
         # Unfinished requests by id.
@@ -114,6 +130,16 @@ class LLMEngine:
 
     def has_unfinished(self) -> bool:
         return self._scheduler.has_unfinished()
+
+    @property
+    def num_running(self) -> int:
+        """Requests in the batch, including those that finished at the last step."""
+        return self._scheduler.num_running
+
+    @property
+    def num_preemptions(self) -> int:
+        """Times a request has given up its KV blocks so far."""
+        return self._scheduler.num_preemptions
 
     @torch.inference_mode()
     def step(self) -> list[RequestOutput]:
