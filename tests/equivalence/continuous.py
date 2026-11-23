@@ -35,6 +35,19 @@ class Setup:
     atol: float
 
 
+@dataclass(frozen=True)
+class RunCounts:
+    """What happened in one run, so a test can check that it covered what it is meant to.
+
+    Attributes:
+        preemptions: Times a request gave up its KV blocks.
+        prefix_hit_tokens: Tokens whose keys and values came from the prefix cache.
+    """
+
+    preemptions: int
+    prefix_hit_tokens: int
+
+
 def random_arrivals(num_requests: int, seed: int, spread: int) -> list[tuple[int, int]]:
     """Returns (step, request index) pairs by step, in random order within a step."""
     generator = random.Random(seed)
@@ -50,7 +63,7 @@ def continuous_logits(
     prompts: Sequence[list[int]],
     forced_tokens: Sequence[list[int]],
     arrivals: Sequence[tuple[int, int]],
-) -> tuple[list[Tensor], int]:
+) -> tuple[list[Tensor], RunCounts]:
     """Runs the prompts through the scheduler and the model runner as they arrive.
 
     Each request is fed the tokens its single run chose (teacher forcing) instead of
@@ -59,7 +72,7 @@ def continuous_logits(
     when it starts again, so it still has one row per forced token.
 
     Returns:
-        The [steps, V] logits of each prompt, and the number of preemptions.
+        The [steps, V] logits of each prompt, and the counts of the run.
     """
     model, config = setup.model, setup.config
     # The pool as LLMEngine sizes it.
@@ -90,30 +103,31 @@ def continuous_logits(
                 seq.num_computed_tokens = seq.num_tokens
                 seq.append(forced_tokens[index][len(seq.output_token_ids)])
         step += 1
-    return [torch.stack(rows) for rows in logits], scheduler.num_preemptions
+    counts = RunCounts(scheduler.num_preemptions, scheduler.num_prefix_hit_tokens)
+    return [torch.stack(rows) for rows in logits], counts
 
 
 def assert_continuous_logits_match(
     setup: Setup, prompts: Sequence[list[int]], num_steps: Sequence[int]
-) -> list[int]:
+) -> list[RunCounts]:
     """Checks every request's logits against its prompt decoded alone, for requests
     arriving in several random orders.
 
     Returns:
-        The number of preemptions in each order.
+        The counts of the run in each order.
     """
     expected = [
         single_greedy(setup.model, prompt, n) for prompt, n in zip(prompts, num_steps, strict=True)
     ]
     forced = [tokens.tolist() for _, tokens in expected]
-    preemptions: list[int] = []
+    counts: list[RunCounts] = []
     for seed, spread in ARRIVAL_SCHEDULES:
         arrivals = random_arrivals(len(prompts), seed, spread)
-        actual, num_preemptions = continuous_logits(setup, prompts, forced, arrivals)
+        actual, run_counts = continuous_logits(setup, prompts, forced, arrivals)
         for (logits, _), row_logits in zip(expected, actual, strict=True):
             assert_greedy_equivalent(row_logits, logits, setup.atol)
-        preemptions.append(num_preemptions)
-    return preemptions
+        counts.append(run_counts)
+    return counts
 
 
 def engine_outputs(
@@ -138,12 +152,12 @@ def engine_outputs(
 
 def assert_same_generation(
     setup: Setup, prompts: Sequence[list[int]], params: Sequence[SamplingParams]
-) -> list[int]:
+) -> list[RunCounts]:
     """Checks that each request gives the tokens, text and finish reason of its prompt
     generated alone, for requests arriving in several random orders.
 
     Returns:
-        The number of preemptions in each order.
+        The counts of the run in each order.
     """
     model, tokenizer = setup.model, setup.tokenizer
     generator = TextGenerator(model, tokenizer)
@@ -156,7 +170,7 @@ def assert_same_generation(
         near_ties = near_tie_steps(logits, setup.atol).nonzero().flatten().tolist()
         comparable.append(near_ties[0] if near_ties else len(steps))
 
-    preemptions: list[int] = []
+    counts: list[RunCounts] = []
     for seed, spread in ARRIVAL_SCHEDULES:
         engine = LLMEngine(model, tokenizer, setup.config)
         arrivals = random_arrivals(len(prompts), seed, spread)
@@ -167,8 +181,8 @@ def assert_same_generation(
             assert got[:num_comparable] == want[:num_comparable]
             if num_comparable == len(steps):
                 assert len(got) == len(want)
-        preemptions.append(engine.num_preemptions)
-    return preemptions
+        counts.append(RunCounts(engine.num_preemptions, engine.num_prefix_hit_tokens))
+    return counts
 
 
 def tiny_model(

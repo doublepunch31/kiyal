@@ -65,8 +65,8 @@ def test_paged_logits_match_single_prompt_logits_on_the_tiny_model(
         enable_prefix_caching=False,
     )
     setup = Setup(model, tiny_tokenizer, config, TINY_ATOL)
-    preemptions = assert_continuous_logits_match(setup, prompts, TINY_OUTPUT_LENGTHS)
-    assert preemptions == [0, 0, 0]
+    counts = assert_continuous_logits_match(setup, prompts, TINY_OUTPUT_LENGTHS)
+    assert [c.preemptions for c in counts] == [0, 0, 0]
 
 
 def test_preempted_logits_match_uninterrupted_logits_on_the_tiny_model(
@@ -75,8 +75,8 @@ def test_preempted_logits_match_uninterrupted_logits_on_the_tiny_model(
     model = tiny_model(make_tiny_checkpoint, tiny_tokenizer)
     prompts = random_prompts(model.config.vocab_size, TINY_PROMPT_LENGTHS)
     setup = Setup(model, tiny_tokenizer, TINY_PREEMPT_CONFIG, TINY_ATOL)
-    preemptions = assert_continuous_logits_match(setup, prompts, TINY_OUTPUT_LENGTHS)
-    assert all(n > 0 for n in preemptions)
+    counts = assert_continuous_logits_match(setup, prompts, TINY_OUTPUT_LENGTHS)
+    assert all(c.preemptions > 0 for c in counts)
 
 
 def test_preempted_generation_matches_uninterrupted_generation_on_the_tiny_model(
@@ -94,10 +94,10 @@ def test_preempted_generation_matches_uninterrupted_generation_on_the_tiny_model
         num_kv_blocks=20,
         enable_prefix_caching=False,
     )
-    preemptions = assert_same_generation(
+    counts = assert_same_generation(
         Setup(model, tiny_tokenizer, config, TINY_ATOL), prompts, params
     )
-    assert all(n > 0 for n in preemptions)
+    assert all(c.preemptions > 0 for c in counts)
 
 
 @pytest.mark.slow
@@ -106,8 +106,8 @@ def test_preempted_logits_match_uninterrupted_logits_on_smollm2(
 ) -> None:
     prompts = [encode_prompt(smollm2_kiyal_tokenizer, p) for p in SMOLLM2_PROMPTS.values()]
     setup = Setup(smollm2, smollm2_kiyal_tokenizer, SMOLLM2_PREEMPT_CONFIG, SMOLLM2_ATOL)
-    preemptions = assert_continuous_logits_match(setup, prompts, SMOLLM2_OUTPUT_LENGTHS)
-    assert all(n > 0 for n in preemptions)
+    counts = assert_continuous_logits_match(setup, prompts, SMOLLM2_OUTPUT_LENGTHS)
+    assert all(c.preemptions > 0 for c in counts)
 
 
 @pytest.mark.slow
@@ -117,5 +117,5 @@ def test_preempted_generation_matches_uninterrupted_generation_on_smollm2(
     prompts = [encode_prompt(smollm2_kiyal_tokenizer, p) for p in SMOLLM2_PROMPTS.values()]
     params = [SamplingParams(max_tokens=n, temperature=0) for n in SMOLLM2_OUTPUT_LENGTHS]
     setup = Setup(smollm2, smollm2_kiyal_tokenizer, SMOLLM2_PREEMPT_CONFIG, SMOLLM2_ATOL)
-    preemptions = assert_same_generation(setup, prompts, params)
-    assert all(n > 0 for n in preemptions)
+    counts = assert_same_generation(setup, prompts, params)
+    assert all(c.preemptions > 0 for c in counts)
