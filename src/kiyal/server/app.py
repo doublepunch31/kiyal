@@ -9,6 +9,7 @@ from typing import Final
 from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse
+from prometheus_client import CONTENT_TYPE_LATEST
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException
 from starlette.types import Receive, Scope, Send
@@ -16,6 +17,7 @@ from starlette.types import Receive, Scope, Send
 from kiyal import __version__
 from kiyal.engine.async_engine import AsyncEngine, EngineStoppedError
 from kiyal.engine.sequence import RequestOutput, SamplingParams
+from kiyal.server.metrics import Metrics
 from kiyal.server.protocol import (
     AssistantMessage,
     ChatChoice,
@@ -84,6 +86,7 @@ def build_app(engine: AsyncEngine, tokenizer: Tokenizer, model_name: str) -> Fas
     app.add_api_route("/v1/chat/completions", server.chat_completions, methods=["POST"])
     app.add_api_route("/v1/models", server.models, methods=["GET"])
     app.add_api_route("/health", server.health, methods=["GET"])
+    app.add_api_route("/metrics", server.metrics, methods=["GET"])
     app.add_exception_handler(APIError, _api_error)
     app.add_exception_handler(RequestValidationError, _validation_error)
     app.add_exception_handler(HTTPException, _http_error)
@@ -97,6 +100,7 @@ class _Server:
         self._tokenizer = tokenizer
         self._model_name = model_name
         self._created = int(time.time())
+        self._metrics = Metrics(engine.stats)
 
     @contextlib.asynccontextmanager
     async def lifespan(self, app: FastAPI) -> abc.AsyncGenerator[None, None]:
@@ -110,6 +114,9 @@ class _Server:
         if not self._engine.is_running:
             raise APIError(HTTPStatus.SERVICE_UNAVAILABLE, "the engine has stopped")
         return Response(status_code=HTTPStatus.OK)
+
+    async def metrics(self) -> Response:
+        return Response(self._metrics.render(), media_type=CONTENT_TYPE_LATEST)
 
     async def models(self) -> Response:
         card = ModelCard(id=self._model_name, created=self._created)
@@ -240,6 +247,7 @@ class _Server:
         Waiting for the first output turns a request that the engine rejects into an error
         response before any part of a streamed response has been sent.
         """
+        arrival = time.perf_counter()
         outputs = self._engine.generate(request_id, prompt_token_ids, params)
         try:
             first = await anext(outputs)
@@ -247,7 +255,42 @@ class _Server:
             raise APIError(HTTPStatus.BAD_REQUEST, str(e)) from e
         except EngineStoppedError as e:
             raise APIError(HTTPStatus.SERVICE_UNAVAILABLE, str(e)) from e
-        return _prepend(first, outputs)
+        self._metrics.time_to_first_token.observe(time.perf_counter() - arrival)
+        self._metrics.prompt_tokens.inc(len(prompt_token_ids))
+        return self._measured(first, outputs, arrival)
+
+    async def _measured(
+        self,
+        first: RequestOutput,
+        rest: abc.AsyncGenerator[RequestOutput, None],
+        arrival: float,
+    ) -> abc.AsyncGenerator[RequestOutput, None]:
+        """Yields `first`, then the outputs of `rest`, and records their latencies.
+
+        `rest` is closed however this ends, which aborts the request if it has not
+        finished.
+        """
+        metrics = self._metrics
+        last_time = time.perf_counter()
+        finish_reason = "abort"
+        try:
+            output = first
+            while True:
+                metrics.generation_tokens.inc()
+                if output.finish_reason is not None:
+                    metrics.e2e_request_latency.observe(last_time - arrival)
+                    finish_reason = output.finish_reason.value
+                yield output
+                try:
+                    output = await anext(rest)
+                except StopAsyncIteration:
+                    break
+                now = time.perf_counter()
+                metrics.inter_token_latency.observe(now - last_time)
+                last_time = now
+        finally:
+            metrics.requests_finished.labels(finish_reason=finish_reason).inc()
+            await rest.aclose()
 
 
 class EventStreamResponse(StreamingResponse):
@@ -301,19 +344,6 @@ async def _wait_for_disconnect(request: Request) -> None:
     # disconnect.
     while (await request.receive())["type"] != "http.disconnect":
         pass
-
-
-async def _prepend(
-    first: RequestOutput, rest: abc.AsyncGenerator[RequestOutput, None]
-) -> abc.AsyncGenerator[RequestOutput, None]:
-    """Yields `first`, then the outputs of `rest`, and closes `rest` however this ends."""
-    try:
-        yield first
-        async for output in rest:
-            yield output
-    finally:
-        # Aborts the request if it has not finished.
-        await rest.aclose()
 
 
 async def _collect(outputs: abc.AsyncGenerator[RequestOutput, None]) -> tuple[str, int, str]:
