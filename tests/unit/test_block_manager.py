@@ -173,17 +173,84 @@ def test_shared_blocks_take_no_free_blocks() -> None:
     assert manager.num_free_blocks == 0
 
 
-def test_a_shared_block_stays_cached_until_no_table_holds_it() -> None:
+def test_a_shared_block_is_free_once_no_table_holds_it() -> None:
     manager, first = cached_manager()
     second = manager.allocate(5, manager.cached_prefix([FIRST]))
     manager.free(first)
-    # Block 0 is still held, block 1 was the first table's only.
-    assert manager.ref_count(0) == 1
-    assert manager.cached_prefix([FIRST, SECOND]) == [0]
+    # Block 0 is still held by the second table, blocks 1 and 2 by none.
+    assert [manager.ref_count(block) for block in range(4)] == [1, 0, 0, 1]
     assert manager.num_free_blocks == 8 - 2
     manager.free(second)
-    assert manager.cached_prefix([FIRST]) == []
     assert manager.num_free_blocks == 8
+
+
+def test_a_freed_cached_block_stays_cached() -> None:
+    manager, first = cached_manager()
+    manager.free(first)
+    assert manager.num_free_blocks == 8
+    assert manager.cached_prefix([FIRST, SECOND]) == [0, 1]
+    second = manager.allocate(9, [0, 1])
+    assert second == [0, 1, 2]
+    assert [manager.ref_count(block) for block in range(3)] == [1, 1, 1]
+    assert manager.num_free_blocks == 8 - 3
+
+
+def test_free_blocks_outside_the_cache_are_taken_before_cached_ones() -> None:
+    manager, first = cached_manager(num_blocks=4)
+    manager.free(first)
+    # Blocks 2 and 3 are free and not cached.
+    assert manager.allocate(8) == [2, 3]
+    assert manager.cached_prefix([FIRST, SECOND]) == [0, 1]
+    # Then the table's last cached block goes first, since the first one is still useful
+    # without it, but not the other way around.
+    assert manager.allocate(4) == [1]
+    assert manager.cached_prefix([FIRST, SECOND]) == [0]
+    assert manager.allocate(4) == [0]
+    assert manager.cached_prefix([FIRST]) == []
+    assert manager.num_free_blocks == 0
+
+
+def test_the_cached_block_freed_longest_ago_is_evicted_first() -> None:
+    manager = BlockManager(num_blocks=4, block_size=BLOCK_SIZE)
+    other = block_hash(None, [1, 2, 3, 4])
+    first, second = manager.allocate(4), manager.allocate(4)
+    manager.cache_block(first[0], FIRST)
+    manager.cache_block(second[0], other)
+    manager.free(first)
+    manager.free(second)
+    # Sharing block 0 again and freeing it makes it the most recently freed.
+    manager.free(manager.allocate(5, [0]))
+    # The blocks outside the cache go first, then block 1 before block 0.
+    assert manager.allocate(8) == [2, 3]
+    assert manager.allocate(4) == [1]
+    assert manager.cached_prefix([other]) == []
+    assert manager.cached_prefix([FIRST]) == [0]
+
+
+def test_sharing_a_freed_cached_block_takes_a_free_block() -> None:
+    manager = BlockManager(num_blocks=4, block_size=BLOCK_SIZE, watermark=1)
+    block_table = manager.allocate(8)
+    manager.cache_block(block_table[0], FIRST)
+    manager.cache_block(block_table[1], SECOND)
+    manager.free(block_table)
+    # Sharing both blocks and taking one more leaves the watermark's one block free.
+    assert manager.can_allocate(12, [0, 1])
+    assert not manager.can_allocate(16, [0, 1])
+    with pytest.raises(NoFreeBlocksError, match="20 tokens need 5 more blocks, but 4 are free"):
+        manager.allocate(20, [0, 1])
+    assert manager.cached_prefix([FIRST, SECOND]) == [0, 1]
+
+
+def test_a_new_table_never_evicts_a_block_it_shares() -> None:
+    manager = BlockManager(num_blocks=2, block_size=BLOCK_SIZE)
+    shared, other = manager.allocate(4), manager.allocate(4)
+    manager.cache_block(shared[0], FIRST)
+    manager.cache_block(other[0], block_hash(None, [1, 2, 3, 4]))
+    manager.free(shared)
+    manager.free(other)
+    # Block 0 was freed first, so it would be evicted first if it were not shared.
+    assert manager.allocate(8, [0]) == [0, 1]
+    assert manager.cached_prefix([FIRST]) == [0]
 
 
 def test_the_cache_keeps_the_first_block_cached_under_a_hash() -> None:
@@ -202,7 +269,7 @@ def test_the_cache_keeps_the_first_block_cached_under_a_hash() -> None:
 
 def test_invalid_caching_and_sharing_raise() -> None:
     manager, _ = cached_manager(num_blocks=4)
-    with pytest.raises(ValueError, match="block 3 is free and cannot be cached"):
+    with pytest.raises(ValueError, match="block 3 is not held by a table and cannot be cached"):
         manager.cache_block(3, FIRST)
     with pytest.raises(ValueError, match="block 0 is cached already, under another hash"):
         manager.cache_block(0, SECOND)

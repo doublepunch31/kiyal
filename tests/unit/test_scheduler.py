@@ -445,6 +445,41 @@ def test_cached_tokens_do_not_count_against_the_token_budget(factory: SequenceFa
     assert names(scheduler.schedule().prefills) == ["a", "b", "c", "d"]
 
 
+def test_a_sequence_shares_the_blocks_of_one_that_has_finished(factory: SequenceFactory) -> None:
+    scheduler, blocks = make_scheduler(prefix_caching=True)
+    first = add(scheduler, factory, "first", PROMPT, max_tokens=1)
+    run(scheduler.schedule())
+    first_blocks = list(first.block_table)
+    assert scheduler.schedule().is_empty
+    assert blocks.num_free_blocks == blocks.num_blocks
+    second = add(scheduler, factory, "second", [*PROMPT[:8], 7])
+    scheduler.schedule()
+    assert second.block_table[:2] == first_blocks[:2]
+    assert second.num_computed_tokens == 8
+
+
+def test_a_preempted_sequence_restarts_after_its_own_cached_blocks(
+    factory: SequenceFactory,
+) -> None:
+    scheduler, _ = make_scheduler(num_blocks=5, prefix_caching=True)
+    old = add(scheduler, factory, "old", [1, 2, 3, 4], max_tokens=6)
+    new = add(scheduler, factory, "new", PROMPT[:8], max_tokens=12)
+    run(scheduler.schedule())
+    new_blocks = list(new.block_table)
+    # "old" needs a third block for its ninth token and preempts "new", whose three full
+    # blocks stay cached. "old" takes the one freed last, which holds generated tokens.
+    while new.status is not SequenceStatus.PREEMPTED:
+        run(scheduler.schedule())
+    assert old.is_finished
+    assert new.num_tokens == 13
+    output = scheduler.schedule()
+    assert names(output.prefills) == ["new"]
+    assert new.block_table[:2] == new_blocks
+    assert new.num_computed_tokens == 8
+    assert new.uncomputed_token_ids() == [TOKEN] * 5
+    assert scheduler.num_preemptions == 1
+
+
 def test_without_prefix_caching_nothing_is_shared(factory: SequenceFactory) -> None:
     scheduler, _ = make_scheduler()
     first = add(scheduler, factory, "first", PROMPT)

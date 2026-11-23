@@ -1,5 +1,6 @@
 import hashlib
 from array import array
+from collections import OrderedDict
 from collections.abc import Sequence
 
 
@@ -45,7 +46,12 @@ class BlockManager:
     them with `cached_prefix` and holds the same blocks, with their counts raised, instead of
     computing their keys and values again. Only full blocks are shared. A sequence writes only
     past its last full block, so it never writes into a block that another table holds, and a
-    shared block needs no copy-on-write. A block leaves the cache when no table holds it.
+    shared block needs no copy-on-write.
+
+    A cached block that no table holds any more stays cached and counts as free: a later
+    sequence can still share it, until the block is needed for something else. Free blocks
+    outside the cache are handed out first. Only when none is left, the cached block that was
+    freed longest ago is taken and leaves the cache (least recently used).
 
     `watermark` blocks are held back from new sequences: an admission must leave them free,
     so the running sequences can still grow at the next steps instead of being preempted
@@ -67,12 +73,15 @@ class BlockManager:
             raise ValueError(f"watermark must be in [0, {num_blocks}), got {watermark}")
         self._block_size = block_size
         self._watermark = watermark
-        # A stack whose top is block 0, so blocks are handed out in order.
+        # Free blocks outside the cache, as a stack whose top is block 0, so blocks are handed
+        # out in order.
         self._free = list(reversed(range(num_blocks)))
         self._ref_counts = [0] * num_blocks
         # The hash each cached block is known by, None for blocks outside the cache.
         self._hashes: list[bytes | None] = [None] * num_blocks
         self._cached: dict[bytes, int] = {}
+        # Cached blocks that no table holds, the one freed longest ago first.
+        self._evictable: OrderedDict[int, None] = OrderedDict()
 
     @property
     def num_blocks(self) -> int:
@@ -88,7 +97,8 @@ class BlockManager:
 
     @property
     def num_free_blocks(self) -> int:
-        return len(self._free)
+        """Blocks that no table holds, including cached ones."""
+        return len(self._free) + len(self._evictable)
 
     def ref_count(self, block: int) -> int:
         """Number of block tables that hold `block`."""
@@ -123,7 +133,7 @@ class BlockManager:
             ValueError: If no table holds the block, or it is cached under another hash.
         """
         if self._ref_counts[block] == 0:
-            raise ValueError(f"block {block} is free and cannot be cached")
+            raise ValueError(f"block {block} is not held by a table and cannot be cached")
         current = self._hashes[block]
         if current is not None:
             if current != content_hash:
@@ -141,8 +151,8 @@ class BlockManager:
             num_tokens: Tokens of the sequence.
             cached_blocks: Cached blocks it shares for its first tokens, from `cached_prefix`.
         """
-        new_blocks = self.blocks_needed(num_tokens) - len(cached_blocks)
-        return self.num_free_blocks - new_blocks >= self._watermark
+        taken = self._blocks_taken(num_tokens, cached_blocks)
+        return self.num_free_blocks - taken >= self._watermark
 
     def allocate(self, num_tokens: int, cached_blocks: Sequence[int] = ()) -> list[int]:
         """Returns a new block table with room for `num_tokens` tokens.
@@ -170,13 +180,15 @@ class BlockManager:
         for block in cached_blocks:
             if self._hashes[block] is None:
                 raise ValueError(f"block {block} is not cached and cannot be shared")
-        missing = self.blocks_needed(num_tokens) - len(cached_blocks)
-        if missing > self.num_free_blocks:
+        taken = self._blocks_taken(num_tokens, cached_blocks)
+        if taken > self.num_free_blocks:
             raise NoFreeBlocksError(
-                f"{num_tokens} tokens need {missing} more blocks, but {self.num_free_blocks} "
-                f"are free"
+                f"{num_tokens} tokens need {taken} more blocks, but {self.num_free_blocks} are free"
             )
+        # Before the new blocks are taken, so that none of them evicts a block shared here.
         for block in cached_blocks:
+            if self._ref_counts[block] == 0:
+                del self._evictable[block]
             self._ref_counts[block] += 1
         block_table = list(cached_blocks)
         self.append_slot(block_table, num_tokens)
@@ -203,14 +215,14 @@ class BlockManager:
                 f"are free"
             )
         for _ in range(missing):
-            block = self._free.pop()
+            block = self._take_free_block()
             self._ref_counts[block] = 1
             block_table.append(block)
 
     def free(self, block_table: list[int]) -> None:
         """Gives up the table's hold on its blocks and empties the table.
 
-        A block becomes free once no table holds it, and leaves the cache then.
+        A block becomes free once no table holds it. A cached block stays cached.
 
         Raises:
             ValueError: If the table holds a block that is free already; nothing is freed
@@ -219,14 +231,31 @@ class BlockManager:
         for block in block_table:
             if self._ref_counts[block] == 0:
                 raise ValueError(f"block {block} is free already")
-        # In reverse, so the next table takes the blocks in the same order and the lowest
-        # ids stay on top of the stack.
+        # In reverse, so the next table takes uncached blocks in the same order and the
+        # lowest ids stay on top of the stack, and a table's last cached blocks are evicted
+        # before its first ones. A cached block is reachable only through every block before
+        # it, so evicting an earlier one first would leave the later ones useless.
         for block in reversed(block_table):
             self._ref_counts[block] -= 1
             if self._ref_counts[block] == 0:
-                content_hash = self._hashes[block]
-                if content_hash is not None:
-                    del self._cached[content_hash]
-                    self._hashes[block] = None
-                self._free.append(block)
+                if self._hashes[block] is None:
+                    self._free.append(block)
+                else:
+                    self._evictable[block] = None
         block_table.clear()
+
+    def _blocks_taken(self, num_tokens: int, cached_blocks: Sequence[int]) -> int:
+        """Free blocks that a new table of `num_tokens` tokens takes: the new ones, and the
+        shared ones that no table holds now."""
+        new_blocks = self.blocks_needed(num_tokens) - len(cached_blocks)
+        return new_blocks + sum(1 for block in cached_blocks if self._ref_counts[block] == 0)
+
+    def _take_free_block(self) -> int:
+        if self._free:
+            return self._free.pop()
+        block, _ = self._evictable.popitem(last=False)
+        content_hash = self._hashes[block]
+        if content_hash is not None:
+            del self._cached[content_hash]
+            self._hashes[block] = None
+        return block
