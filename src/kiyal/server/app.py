@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import time
 import uuid
@@ -10,6 +11,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException
+from starlette.types import Receive, Scope, Send
 
 from kiyal import __version__
 from kiyal.engine.async_engine import AsyncEngine, EngineStoppedError
@@ -36,6 +38,9 @@ from kiyal.tokenizer import Tokenizer, TokenizerError
 
 # OpenAI's default for /v1/completions.
 DEFAULT_COMPLETION_TOKENS: Final = 16
+# The status that servers such as nginx log for a client that left before the response; no
+# client ever receives it.
+CLIENT_CLOSED_REQUEST: Final = 499
 
 
 class APIError(Exception):
@@ -110,7 +115,13 @@ class _Server:
         card = ModelCard(id=self._model_name, created=self._created)
         return _json(ModelList(data=[card]))
 
-    async def completions(self, body: CompletionRequest) -> Response:
+    async def completions(self, body: CompletionRequest, request: Request) -> Response:
+        return await _cancel_on_disconnect(request, self._completions(body))
+
+    async def chat_completions(self, body: ChatCompletionRequest, request: Request) -> Response:
+        return await _cancel_on_disconnect(request, self._chat_completions(body))
+
+    async def _completions(self, body: CompletionRequest) -> Response:
         self._check(body)
         if body.echo:
             raise APIError(HTTPStatus.BAD_REQUEST, "echo is not supported", param="echo")
@@ -139,12 +150,12 @@ class _Server:
                 lambda num_tokens: completion([], _usage(num_prompt_tokens, num_tokens)),
                 include_usage=_include_usage(body),
             )
-            return StreamingResponse(events, media_type="text/event-stream")
+            return EventStreamResponse(events)
         text, num_tokens, reason = await _collect(outputs)
         choice = CompletionChoice(index=0, text=text, finish_reason=reason)
         return _json(completion([choice], _usage(num_prompt_tokens, num_tokens)))
 
-    async def chat_completions(self, body: ChatCompletionRequest) -> Response:
+    async def _chat_completions(self, body: ChatCompletionRequest) -> Response:
         self._check(body)
         if body.logprobs:
             raise APIError(HTTPStatus.BAD_REQUEST, "logprobs are not supported", param="logprobs")
@@ -192,7 +203,7 @@ class _Server:
                     None,
                 ),
             )
-            return StreamingResponse(events, media_type="text/event-stream")
+            return EventStreamResponse(events)
         text, num_tokens, reason = await _collect(outputs)
         choice = ChatChoice(index=0, message=AssistantMessage(content=text), finish_reason=reason)
         completion = ChatCompletion(
@@ -237,6 +248,59 @@ class _Server:
         except EngineStoppedError as e:
             raise APIError(HTTPStatus.SERVICE_UNAVAILABLE, str(e)) from e
         return _prepend(first, outputs)
+
+
+class EventStreamResponse(StreamingResponse):
+    """Server-sent events from a generator that is closed when the response ends.
+
+    Starlette stops iterating the body when the client disconnects but does not close it.
+    If the disconnect comes while an event is being sent, the generator is left at a
+    yield, and its cleanup, which aborts the request, would wait until the generator is
+    garbage collected. Closing it here aborts the request at once.
+    """
+
+    def __init__(self, events: abc.AsyncGenerator[str, None]) -> None:
+        super().__init__(events, media_type="text/event-stream")
+        self._events = events
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._events.aclose()
+
+
+async def _cancel_on_disconnect(request: Request, handler: abc.Awaitable[Response]) -> Response:
+    """Runs a handler, and cancels it if the client disconnects before it returns.
+
+    Starlette notices a disconnect only while it sends a streamed response. Before the
+    handler returns, nothing reads from the connection, so a client that gave up on a
+    response, or on a stream before its first token, would leave its request running to
+    the end. Cancelling the handler aborts the request it waits for.
+    """
+    work = asyncio.ensure_future(handler)
+    watcher = asyncio.ensure_future(_wait_for_disconnect(request))
+    try:
+        await asyncio.wait({work, watcher}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        # Both tasks end before this returns, also when this task is cancelled, as on
+        # shutdown. The watcher must be gone before a streamed response starts reading
+        # the connection itself.
+        for task in (watcher, work):
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+    if work.cancelled():
+        return Response(status_code=CLIENT_CLOSED_REQUEST)
+    return work.result()
+
+
+async def _wait_for_disconnect(request: Request) -> None:
+    # FastAPI has read the whole body before the handler runs, so the next message is the
+    # disconnect.
+    while (await request.receive())["type"] != "http.disconnect":
+        pass
 
 
 async def _prepend(
