@@ -2,10 +2,13 @@ import contextlib
 import socket
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import uvicorn
 from fastapi import FastAPI
+
+from kiyal.engine.async_engine import EngineStats
+from kiyal.server.app import ServingEngine
 
 
 @contextlib.contextmanager
@@ -32,3 +35,21 @@ def serving(app: FastAPI) -> Iterator[str]:
         server.should_exit = True
         thread.join(timeout=10)
         sock.close()
+
+
+def wait_for(engine: ServingEngine, condition: Callable[[EngineStats], bool]) -> EngineStats:
+    """Polls the engine's stats until the condition holds, for up to 10 seconds."""
+    deadline = time.monotonic() + 10
+    while not condition(stats := engine.stats()):
+        if time.monotonic() > deadline:
+            raise AssertionError(f"the engine did not get there; its last stats were {stats}")
+        time.sleep(0.01)
+    return stats
+
+
+def is_idle(stats: EngineStats) -> bool:
+    return (
+        stats.num_running == 0
+        and stats.num_waiting == 0
+        and stats.num_free_kv_blocks == stats.num_kv_blocks
+    )

@@ -1,6 +1,5 @@
 import asyncio
-import time
-from collections.abc import AsyncGenerator, Callable, Iterator
+from collections.abc import AsyncGenerator, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -9,13 +8,13 @@ import pytest
 from starlette.types import Message
 
 from kiyal.config import EngineConfig
-from kiyal.engine.async_engine import AsyncEngine, EngineStats
+from kiyal.engine.async_engine import AsyncEngine
 from kiyal.engine.llm_engine import LLMEngine
 from kiyal.model.llama import LlamaModel
 from kiyal.server.app import EventStreamResponse, build_app
 from kiyal.tokenizer import Tokenizer
 from tests.server.conftest import MODEL_NAME, Server
-from tests.server.serving import serving
+from tests.server.serving import is_idle, serving, wait_for
 
 # Long enough that a client always leaves before the request ends: 2000 steps take most of
 # a second on a CPU.
@@ -28,26 +27,6 @@ BODIES: dict[str, dict[str, Any]] = {
         **LONG,
     },
 }
-
-
-def wait_for(engine: AsyncEngine, condition: Callable[[EngineStats], bool]) -> EngineStats:
-    """Polls the engine's stats until the condition holds, for up to 5 seconds."""
-    stats = engine.stats()
-    deadline = time.monotonic() + 5
-    while not condition(stats):
-        if time.monotonic() > deadline:
-            raise AssertionError(f"the engine did not get there; its last stats were {stats}")
-        time.sleep(0.01)
-        stats = engine.stats()
-    return stats
-
-
-def is_idle(stats: EngineStats) -> bool:
-    return (
-        stats.num_running == 0
-        and stats.num_waiting == 0
-        and stats.num_free_kv_blocks == stats.num_kv_blocks
-    )
 
 
 @pytest.mark.parametrize("endpoint", BODIES)

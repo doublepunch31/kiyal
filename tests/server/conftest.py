@@ -13,7 +13,7 @@ from kiyal.engine.llm_engine import LLMEngine
 from kiyal.engine.sequence import SamplingParams
 from kiyal.model.llama import LlamaModel
 from kiyal.model.loader import load_model
-from kiyal.server.app import build_app
+from kiyal.server.app import ServingEngine, build_app
 from kiyal.tokenizer import Tokenizer
 from tests.server.serving import serving
 
@@ -23,7 +23,7 @@ MODEL_NAME = "tiny"
 @dataclass(frozen=True)
 class Server:
     base_url: str
-    engine: AsyncEngine
+    engine: ServingEngine
 
 
 @dataclass(frozen=True)
