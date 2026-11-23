@@ -15,6 +15,13 @@ from kiyal import __version__
 from kiyal.engine.async_engine import AsyncEngine, EngineStoppedError
 from kiyal.engine.sequence import RequestOutput, SamplingParams
 from kiyal.server.protocol import (
+    AssistantMessage,
+    ChatChoice,
+    ChatChunkChoice,
+    ChatCompletion,
+    ChatCompletionChunk,
+    ChatCompletionRequest,
+    ChatDelta,
     Completion,
     CompletionChoice,
     CompletionRequest,
@@ -25,7 +32,7 @@ from kiyal.server.protocol import (
     SamplingRequest,
     Usage,
 )
-from kiyal.tokenizer import Tokenizer
+from kiyal.tokenizer import Tokenizer, TokenizerError
 
 # OpenAI's default for /v1/completions.
 DEFAULT_COMPLETION_TOKENS: Final = 16
@@ -69,6 +76,7 @@ def build_app(engine: AsyncEngine, tokenizer: Tokenizer, model_name: str) -> Fas
     server = _Server(engine, tokenizer, model_name)
     app = FastAPI(title="Kiyal", version=__version__, lifespan=server.lifespan)
     app.add_api_route("/v1/completions", server.completions, methods=["POST"])
+    app.add_api_route("/v1/chat/completions", server.chat_completions, methods=["POST"])
     app.add_api_route("/v1/models", server.models, methods=["GET"])
     app.add_api_route("/health", server.health, methods=["GET"])
     app.add_exception_handler(APIError, _api_error)
@@ -135,6 +143,66 @@ class _Server:
         text, num_tokens, reason = await _collect(outputs)
         choice = CompletionChoice(index=0, text=text, finish_reason=reason)
         return _json(completion([choice], _usage(num_prompt_tokens, num_tokens)))
+
+    async def chat_completions(self, body: ChatCompletionRequest) -> Response:
+        self._check(body)
+        if body.logprobs:
+            raise APIError(HTTPStatus.BAD_REQUEST, "logprobs are not supported", param="logprobs")
+        max_tokens = body.max_completion_tokens
+        if max_tokens is None:
+            max_tokens = body.max_tokens
+        if max_tokens is None:
+            # As in OpenAI's API, the reply may fill the rest of the context; the engine
+            # lowers this to the room the prompt leaves.
+            max_tokens = self._engine.max_model_len
+        params = _sampling_params(body, max_tokens)
+        messages = [{"role": message.role, "content": message.content} for message in body.messages]
+        try:
+            prompt_token_ids = self._tokenizer.encode_chat(messages)
+        except TokenizerError as e:
+            raise APIError(HTTPStatus.BAD_REQUEST, str(e), param="messages") from e
+        num_prompt_tokens = len(prompt_token_ids)
+        request_id = f"chatcmpl-{uuid.uuid4().hex}"
+        created = int(time.time())
+        outputs = await self._start(request_id, prompt_token_ids, params)
+
+        def chunk(choices: list[ChatChunkChoice], usage: Usage | None) -> ChatCompletionChunk:
+            return ChatCompletionChunk(
+                id=request_id, created=created, model=self._model_name, choices=choices, usage=usage
+            )
+
+        if body.stream:
+            events = _events(
+                outputs,
+                lambda text, reason: chunk(
+                    [ChatChunkChoice(index=0, delta=ChatDelta(content=text), finish_reason=reason)],
+                    None,
+                ),
+                lambda num_tokens: chunk([], _usage(num_prompt_tokens, num_tokens)),
+                include_usage=_include_usage(body),
+                # OpenAI's first chunk names the role and carries no text yet.
+                opening=chunk(
+                    [
+                        ChatChunkChoice(
+                            index=0,
+                            delta=ChatDelta(role="assistant", content=""),
+                            finish_reason=None,
+                        )
+                    ],
+                    None,
+                ),
+            )
+            return StreamingResponse(events, media_type="text/event-stream")
+        text, num_tokens, reason = await _collect(outputs)
+        choice = ChatChoice(index=0, message=AssistantMessage(content=text), finish_reason=reason)
+        completion = ChatCompletion(
+            id=request_id,
+            created=created,
+            model=self._model_name,
+            choices=[choice],
+            usage=_usage(num_prompt_tokens, num_tokens),
+        )
+        return _json(completion)
 
     def _check(self, body: SamplingRequest) -> None:
         if body.model != self._model_name:

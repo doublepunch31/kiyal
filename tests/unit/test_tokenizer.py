@@ -81,6 +81,28 @@ def test_encode_chat_does_not_add_a_second_bos(tiny_tokenizer: Tokenizer) -> Non
     assert tiny_tokenizer.decode(ids, skip_special_tokens=False) == text
 
 
+# Rejects conversations that do not start with a user message, as some models' templates do.
+STRICT_TEMPLATE = (
+    "{% if messages[0]['role'] != 'user' %}"
+    "{{ raise_exception('the conversation must start with a user message') }}"
+    "{% endif %}"
+    "{% for message in messages %}{{ message['content'] }}{% endfor %}"
+)
+
+
+def test_a_template_that_rejects_the_messages_raises(
+    tiny_tokenizer_dir: Path, tmp_path: Path
+) -> None:
+    model_dir = tmp_path / "strict-template"
+    shutil.copytree(tiny_tokenizer_dir, model_dir)
+    (model_dir / "chat_template.jinja").write_text(STRICT_TEMPLATE)
+    tokenizer = Tokenizer.from_dir(model_dir)
+    assert tokenizer.apply_chat_template([{"role": "user", "content": "hi"}]) == "hi"
+    message = "the chat template failed: the conversation must start with a user message"
+    with pytest.raises(TokenizerError, match=message):
+        tokenizer.encode_chat([{"role": "assistant", "content": "hi"}])
+
+
 def test_missing_chat_template_raises(tiny_tokenizer_dir: Path, tmp_path: Path) -> None:
     model_dir = tmp_path / "no-template"
     shutil.copytree(tiny_tokenizer_dir, model_dir)

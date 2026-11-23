@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class StreamOptions(BaseModel):
@@ -46,6 +46,23 @@ class CompletionRequest(SamplingRequest):
     logprobs: int | None = None
 
 
+class ChatMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["system", "user", "assistant"]
+    content: str
+
+
+class ChatCompletionRequest(SamplingRequest):
+    """Body of `POST /v1/chat/completions`."""
+
+    messages: list[ChatMessage] = Field(min_length=1)
+    # OpenAI's newer name for max_tokens; it wins when both are given.
+    max_completion_tokens: int | None = None
+    max_tokens: int | None = None
+    logprobs: bool | None = None
+
+
 class Usage(BaseModel):
     prompt_tokens: int
     completion_tokens: int
@@ -65,6 +82,48 @@ class Completion(BaseModel):
     created: int
     model: str
     choices: list[CompletionChoice]
+    usage: Usage | None
+
+
+class AssistantMessage(BaseModel):
+    role: Literal["assistant"] = "assistant"
+    content: str
+
+
+class ChatChoice(BaseModel):
+    index: int
+    message: AssistantMessage
+    logprobs: None = None
+    finish_reason: str
+
+
+class ChatCompletion(BaseModel):
+    id: str
+    object: Literal["chat.completion"] = "chat.completion"
+    created: int
+    model: str
+    choices: list[ChatChoice]
+    usage: Usage
+
+
+class ChatDelta(BaseModel):
+    role: Literal["assistant"] | None = None
+    content: str | None = None
+
+
+class ChatChunkChoice(BaseModel):
+    index: int
+    delta: ChatDelta
+    logprobs: None = None
+    finish_reason: str | None
+
+
+class ChatCompletionChunk(BaseModel):
+    id: str
+    object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
+    created: int
+    model: str
+    choices: list[ChatChunkChoice]
     usage: Usage | None
 
 

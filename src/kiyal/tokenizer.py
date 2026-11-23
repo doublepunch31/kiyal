@@ -2,6 +2,7 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Final, Protocol, Self, cast
 
+import jinja2
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 TOKENIZER_FILE: Final = "tokenizer.json"
@@ -13,7 +14,8 @@ PROMPT_CONTEXT_TOKENS: Final = 8
 
 
 class TokenizerError(Exception):
-    """Raised when tokenizer files are missing or a model has no chat template."""
+    """Raised when tokenizer files are missing, a model has no chat template, or the
+    template rejects the messages."""
 
 
 class _Backend(Protocol):
@@ -95,15 +97,21 @@ class Tokenizer:
                 reply, so that the model answers instead of continuing the last message.
 
         Raises:
-            TokenizerError: If the model has no chat template.
+            TokenizerError: If the model has no chat template, or the template rejects the
+                messages, for example because the roles are out of order.
         """
         if not self.has_chat_template:
             raise TokenizerError("the tokenizer has no chat template")
-        return self._backend.apply_chat_template(
-            [dict(message) for message in messages],
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-        )
+        try:
+            return self._backend.apply_chat_template(
+                [dict(message) for message in messages],
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+            )
+        except jinja2.TemplateError as e:
+            # Templates reject messages they cannot render with raise_exception, which
+            # raises TemplateError.
+            raise TokenizerError(f"the chat template failed: {e}") from e
 
     def encode_chat(
         self, messages: Sequence[Mapping[str, str]], *, add_generation_prompt: bool = True
@@ -111,7 +119,8 @@ class Tokenizer:
         """Renders chat messages and tokenizes the result.
 
         Raises:
-            TokenizerError: If the model has no chat template.
+            TokenizerError: If the model has no chat template, or the template rejects the
+                messages.
         """
         text = self.apply_chat_template(messages, add_generation_prompt=add_generation_prompt)
         # The template writes its own special tokens; adding them again would duplicate BOS.
