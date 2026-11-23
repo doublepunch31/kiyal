@@ -1,8 +1,12 @@
 import pytest
 
-from kiyal.cache.block_manager import BlockManager, NoFreeBlocksError
+from kiyal.cache.block_manager import BlockManager, NoFreeBlocksError, block_hash
 
 BLOCK_SIZE = 4
+TOKENS = [11, 12, 13, 14, 21, 22, 23, 24, 31, 32]
+# Hashes of the first two blocks of TOKENS.
+FIRST = block_hash(None, TOKENS[:4])
+SECOND = block_hash(FIRST, TOKENS[4:8])
 
 
 def test_a_new_manager_has_every_block_free() -> None:
@@ -121,3 +125,91 @@ def test_invalid_sizes_raise(
 def test_an_empty_allocation_raises() -> None:
     with pytest.raises(ValueError, match="num_tokens must be 1 or greater"):
         BlockManager(num_blocks=2, block_size=BLOCK_SIZE).allocate(0)
+
+
+def test_a_block_hash_stands_for_its_tokens_and_every_token_before_them() -> None:
+    assert block_hash(None, TOKENS[:4]) == FIRST
+    assert len(FIRST) == 32
+    assert block_hash(None, [11, 12, 13, 15]) != FIRST
+    # The same tokens after another prefix, or at the start, are another block.
+    assert block_hash(block_hash(None, [1, 2, 3, 4]), TOKENS[4:8]) != SECOND
+    assert block_hash(None, TOKENS[4:8]) != SECOND
+
+
+def cached_manager(num_blocks: int = 8) -> tuple[BlockManager, list[int]]:
+    """Returns a manager with one sequence of TOKENS whose two full blocks are cached."""
+    manager = BlockManager(num_blocks=num_blocks, block_size=BLOCK_SIZE)
+    block_table = manager.allocate(len(TOKENS))
+    manager.cache_block(block_table[0], FIRST)
+    manager.cache_block(block_table[1], SECOND)
+    return manager, block_table
+
+
+def test_a_new_table_shares_the_cached_blocks_of_its_prefix() -> None:
+    manager, first = cached_manager()
+    assert first == [0, 1, 2]
+    shared = manager.cached_prefix([FIRST, SECOND])
+    assert shared == [0, 1]
+    second = manager.allocate(9, shared)
+    assert second == [0, 1, 3]
+    assert [manager.ref_count(block) for block in range(4)] == [2, 2, 1, 1]
+    assert manager.num_free_blocks == 4
+
+
+def test_the_cached_prefix_ends_at_the_first_block_not_in_the_cache() -> None:
+    manager, _ = cached_manager()
+    other = block_hash(None, [1, 2, 3, 4])
+    assert manager.cached_prefix([FIRST, other, SECOND]) == [0]
+    assert manager.cached_prefix([other, SECOND]) == []
+    assert manager.cached_prefix([]) == []
+
+
+def test_shared_blocks_take_no_free_blocks() -> None:
+    manager, _ = cached_manager(num_blocks=4)
+    assert manager.num_free_blocks == 1
+    assert not manager.can_allocate(12)
+    assert manager.can_allocate(12, [0, 1])
+    manager.allocate(12, [0, 1])
+    assert manager.num_free_blocks == 0
+
+
+def test_a_shared_block_stays_cached_until_no_table_holds_it() -> None:
+    manager, first = cached_manager()
+    second = manager.allocate(5, manager.cached_prefix([FIRST]))
+    manager.free(first)
+    # Block 0 is still held, block 1 was the first table's only.
+    assert manager.ref_count(0) == 1
+    assert manager.cached_prefix([FIRST, SECOND]) == [0]
+    assert manager.num_free_blocks == 8 - 2
+    manager.free(second)
+    assert manager.cached_prefix([FIRST]) == []
+    assert manager.num_free_blocks == 8
+
+
+def test_the_cache_keeps_the_first_block_cached_under_a_hash() -> None:
+    manager, _ = cached_manager()
+    # A second table that computed the same first block, for example in the same step.
+    duplicate = manager.allocate(4)
+    manager.cache_block(duplicate[0], FIRST)
+    assert manager.cached_prefix([FIRST]) == [0]
+    # It is still its table's own, so freeing it does not touch the cache.
+    manager.free(duplicate)
+    assert manager.cached_prefix([FIRST, SECOND]) == [0, 1]
+    # Caching a block again under its own hash changes nothing.
+    manager.cache_block(0, FIRST)
+    assert manager.cached_prefix([FIRST]) == [0]
+
+
+def test_invalid_caching_and_sharing_raise() -> None:
+    manager, _ = cached_manager(num_blocks=4)
+    with pytest.raises(ValueError, match="block 3 is free and cannot be cached"):
+        manager.cache_block(3, FIRST)
+    with pytest.raises(ValueError, match="block 0 is cached already, under another hash"):
+        manager.cache_block(0, SECOND)
+    with pytest.raises(ValueError, match="block 2 is not cached and cannot be shared"):
+        manager.allocate(12, [0, 2])
+    with pytest.raises(ValueError, match="2 shared blocks hold more than 7 tokens"):
+        manager.allocate(7, [0, 1])
+    with pytest.raises(NoFreeBlocksError, match="16 tokens need 2 more blocks, but 1 are free"):
+        manager.allocate(16, [0, 1])
+    assert [manager.ref_count(block) for block in range(4)] == [1, 1, 1, 0]
