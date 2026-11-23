@@ -13,12 +13,6 @@ from tests.server.conftest import MODEL_NAME, Server
 PROMPT = "the cat sat on"
 
 
-@pytest.fixture(scope="module")
-def chat_prompt(tiny_tokenizer: Tokenizer) -> list[int]:
-    """Token ids whose greedy continuation contains plain words, for stop strings."""
-    return tiny_tokenizer.encode_chat([{"role": "user", "content": "the cat"}])
-
-
 def test_a_completion_is_what_the_engine_generates(
     client: OpenAI, tiny_tokenizer: Tokenizer, reference: Any
 ) -> None:

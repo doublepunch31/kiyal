@@ -3,6 +3,12 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 
+class StreamOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    include_usage: bool | None = None
+
+
 class SamplingRequest(BaseModel):
     """Fields that the completion endpoints share: the model and the sampling settings.
 
@@ -18,6 +24,8 @@ class SamplingRequest(BaseModel):
     top_p: float | None = None
     stop: str | list[str] | None = None
     seed: int | None = None
+    stream: bool | None = None
+    stream_options: StreamOptions | None = None
     n: int | None = None
     presence_penalty: float | None = None
     frequency_penalty: float | None = None

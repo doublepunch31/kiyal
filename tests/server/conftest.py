@@ -57,6 +57,12 @@ def client(server: Server) -> Iterator[OpenAI]:
 
 
 @pytest.fixture(scope="module")
+def chat_prompt(tiny_tokenizer: Tokenizer) -> list[int]:
+    """Token ids whose greedy continuation contains plain words, for stop strings."""
+    return tiny_tokenizer.encode_chat([{"role": "user", "content": "the cat"}])
+
+
+@pytest.fixture(scope="module")
 def reference(model: LlamaModel, tiny_tokenizer: Tokenizer):
     """Returns a function that generates a prompt's output offline."""
     generator = TextGenerator(model, tiny_tokenizer)
