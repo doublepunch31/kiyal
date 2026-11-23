@@ -139,8 +139,8 @@ class Sequence:
             been hashed so far, in order, for prefix caching. Kept through preemption, since
             the tokens do not change.
         num_cached_blocks: Blocks at the start of `block_table` that the prefix cache has
-            been offered: their keys and values are computed, and the cache holds them or
-            another block with the same tokens.
+            been offered: they are full once the current step has run, and the cache holds
+            them or another block with the same tokens.
         arrival_time: When the request was added, from `time.perf_counter()`, like the
             other times.
         first_scheduled_time: When the sequence first entered the batch, not counting

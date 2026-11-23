@@ -255,7 +255,7 @@ def test_a_new_table_never_evicts_a_block_it_shares() -> None:
 
 def test_the_cache_keeps_the_first_block_cached_under_a_hash() -> None:
     manager, _ = cached_manager()
-    # A second table that computed the same first block, for example in the same step.
+    # A second table that computed a block with the same tokens itself.
     duplicate = manager.allocate(4)
     manager.cache_block(duplicate[0], FIRST)
     assert manager.cached_prefix([FIRST]) == [0]

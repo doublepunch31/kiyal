@@ -1,3 +1,4 @@
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -215,6 +216,27 @@ def test_a_request_runs_only_the_prompt_tokens_after_its_cached_prefix(
     # run, then both decode together.
     assert forward_sizes(model, engine, monkeypatch) == [2, 2, 2]
     assert (engine.num_prefix_query_tokens, engine.num_prefix_hit_tokens) == (27, 12)
+
+
+def test_requests_that_start_together_compute_their_shared_prefix_once(
+    model: LlamaModel, tiny_tokenizer: Tokenizer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared = list(range(10, 22))
+    requests = [[*shared, 30], [*shared, 40, 41]]
+    params = [SamplingParams(max_tokens=3, temperature=0, ignore_eos=True)] * 2
+    config = EngineConfig(max_num_seqs=2, block_size=4)
+    without_cache = LLMEngine(
+        model, tiny_tokenizer, dataclasses.replace(config, enable_prefix_caching=False)
+    )
+    expected = [c.token_ids for c in without_cache.generate(requests, params)]
+    assert [
+        c.token_ids for c in LLMEngine(model, tiny_tokenizer, config).generate(requests, params)
+    ] == expected
+    engine = LLMEngine(model, tiny_tokenizer, config)
+    for prompt, prompt_params in zip(requests, params, strict=True):
+        engine.add_request(prompt, prompt_params)
+    # The second request shares the three blocks the first one fills in the same step.
+    assert forward_sizes(model, engine, monkeypatch) == [13 + 2, 2, 2]
 
 
 def test_generate_returns_each_prompts_completion(

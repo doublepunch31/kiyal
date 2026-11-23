@@ -41,10 +41,10 @@ class BlockManager:
     Every block has a reference count, the number of block tables that hold it, and is free
     again when the count drops to 0.
 
-    Prefix caching. Once a full block's keys and values are computed, the caller can cache it
-    under its `block_hash`. A later sequence whose first blocks hold the same tokens finds
-    them with `cached_prefix` and holds the same blocks, with their counts raised, instead of
-    computing their keys and values again. Only full blocks are shared. A sequence writes only
+    Prefix caching. The caller can cache a full block under its `block_hash`. A later
+    sequence whose first blocks hold the same tokens finds them with `cached_prefix` and holds
+    the same blocks, with their counts raised, instead of computing their keys and values
+    again. Only full blocks are shared. A sequence writes only
     past its last full block, so it never writes into a block that another table holds, and a
     shared block needs no copy-on-write.
 
@@ -123,11 +123,12 @@ class BlockManager:
         return blocks
 
     def cache_block(self, block: int, content_hash: bytes) -> None:
-        """Lets later sequences share a full block whose keys and values are computed.
+        """Lets later tables share a full block.
 
-        If another block is cached under the same hash, for example because two sequences
-        with the same prefix computed it in the same step, the cache keeps that one, and this
-        block stays its table's own.
+        The caller makes sure that the block's keys and values are written before any table
+        that shares it reads them. If another block is cached under the same hash, for
+        example because a sequence with the same tokens had to compute its last block itself,
+        the cache keeps that one, and this block stays its table's own.
 
         Raises:
             ValueError: If no table holds the block, or it is cached under another hash.

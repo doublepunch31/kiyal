@@ -403,22 +403,32 @@ def test_the_last_token_runs_even_when_every_block_before_it_is_cached(
     assert second.uncomputed_token_ids() == PROMPT[4:8]
 
 
-def test_blocks_are_cached_once_their_keys_and_values_are_computed(
+def test_a_sequence_shares_the_blocks_another_fills_in_the_same_step(
     factory: SequenceFactory,
 ) -> None:
-    scheduler, _ = make_scheduler(prefix_caching=True)
+    scheduler, _ = make_scheduler(max_num_batched_tokens=13, prefix_caching=True)
     first = add(scheduler, factory, "first", PROMPT)
-    # Starts in the same step as the first, so nothing is computed yet that it could share.
-    second = add(scheduler, factory, "second", PROMPT)
+    second = add(scheduler, factory, "second", [*PROMPT[:8], 7, 8, 9])
+    # The first computes all of its 10 tokens, the second only the 3 after the 8 it shares,
+    # so both fit in a budget of 13.
     output = scheduler.schedule()
     assert names(output.prefills) == ["first", "second"]
-    assert set(first.block_table).isdisjoint(second.block_table)
-    run(output)
-    # The cache holds the first sequence's blocks, not the second's copy of them.
-    third = add(scheduler, factory, "third", PROMPT)
-    scheduler.schedule()
-    assert third.block_table[:2] == first.block_table[:2]
+    assert second.block_table[:2] == first.block_table[:2]
+    assert second.uncomputed_token_ids() == [7, 8, 9]
     assert scheduler.num_prefix_hit_tokens == 8
+
+
+def test_the_cache_keeps_one_block_for_the_same_tokens(factory: SequenceFactory) -> None:
+    scheduler, _ = make_scheduler(prefix_caching=True)
+    first = add(scheduler, factory, "first", PROMPT[:8])
+    # Shares the first block, and computes its last block itself, like the first does.
+    second = add(scheduler, factory, "second", PROMPT[:8])
+    run(scheduler.schedule())
+    assert second.block_table[0] == first.block_table[0]
+    assert second.block_table[1] != first.block_table[1]
+    third = add(scheduler, factory, "third", [*PROMPT[:8], 1])
+    scheduler.schedule()
+    assert third.block_table[:2] == first.block_table
 
 
 def test_blocks_filled_by_generated_tokens_are_cached(factory: SequenceFactory) -> None:

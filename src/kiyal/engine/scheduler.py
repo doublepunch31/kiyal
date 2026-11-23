@@ -55,11 +55,17 @@ class Scheduler:
       again, its prompt and its output so far run as one prefill, which computes the lost
       keys and values again. At these model sizes that is cheaper than copying the blocks
       to host memory and back, and it needs no second pool.
-    - Prefix caching, when enabled. Once a full block's keys and values are computed, the
-      block is cached under the hash of its tokens and all tokens before them. A starting
-      sequence shares the cached blocks of its longest matching prefix and runs only the
-      tokens after it, which also count against the token budget. A cached block is never
-      written to, so its keys and values stay those of the tokens it was cached for.
+    - Prefix caching, when enabled. A block is cached, under the hash of its tokens and all
+      tokens before them, as soon as a step is scheduled that fills it. A starting sequence
+      shares the cached blocks of its longest matching prefix and runs only the tokens
+      after it, which also count against the token budget. A cached block is never written
+      to again, so its keys and values stay those of the tokens it was cached for.
+
+      Caching a block before its keys and values exist is safe because each layer of the
+      forward pass writes the keys and values of all the step's tokens to the pool before
+      any token of the step reads from it. So a sequence that starts in the same step as
+      another with the same prefix, as requests that arrive together do, shares the blocks
+      the other one fills in that step instead of computing them as well.
 
     The scheduler hands out KV blocks and takes them back. It never runs the model and
     does not add tokens; the engine does both and reports finished sequences through their
@@ -125,14 +131,14 @@ class Scheduler:
     def schedule(self) -> SchedulerOutput:
         """Picks the sequences of the next step.
 
-        Blocks filled at the last step join the prefix cache first. Then the sequences that
-        finished leave the batch, and their KV blocks become free.
+        Sequences that finished since the last step leave the batch first, and their KV
+        blocks become free.
 
         Returns:
             Prefills if a waiting sequence fits, otherwise a decode of every running
             sequence that keeps its blocks. Empty when nothing is left to run.
         """
-        self._update_running()
+        self._release_finished()
         prefills = self._admit()
         if prefills:
             return SchedulerOutput(prefills=prefills, decodes=[])
@@ -153,7 +159,7 @@ class Scheduler:
         for seq in self._running:
             if seq.request_id == request_id and not seq.is_finished:
                 seq.finish(FinishReason.ABORT)
-                self._update_running()
+                self._release_finished()
                 return seq
         return None
 
@@ -177,6 +183,8 @@ class Scheduler:
             seq.block_table = self._blocks.allocate(seq.num_tokens, cached_blocks)
             seq.num_computed_tokens = num_cached_tokens
             seq.num_cached_blocks = len(cached_blocks)
+            # Before the next waiting sequence looks up its prefix, so it can share these.
+            self._cache_filled_blocks(seq)
             seq.status = SequenceStatus.RUNNING
             if seq.first_scheduled_time is None:
                 seq.first_scheduled_time = time.perf_counter()
@@ -210,11 +218,15 @@ class Scheduler:
                 hashes.append(block_hash(parent, token_ids[index * size : (index + 1) * size]))
         return hashes
 
-    def _cache_computed_blocks(self, seq: Sequence) -> None:
-        """Offers the sequence's full blocks computed since the last offer to the cache."""
+    def _cache_filled_blocks(self, seq: Sequence) -> None:
+        """Offers the cache the sequence's blocks that the step being scheduled fills.
+
+        The step computes every token of the sequence that is not computed yet, so all its
+        blocks are full afterwards, except a last one that holds fewer tokens than a block.
+        """
         if not self._config.enable_prefix_caching:
             return
-        num_full = seq.num_computed_tokens // self._blocks.block_size
+        num_full = seq.num_tokens // self._blocks.block_size
         if num_full <= seq.num_cached_blocks:
             return
         hashes = self._block_hashes(seq, num_full)
@@ -241,6 +253,9 @@ class Scheduler:
                 self._preempt(queue.pop())
             if self._blocks.can_append(seq.block_table, seq.num_tokens):
                 self._blocks.append_slot(seq.block_table, seq.num_tokens)
+                # A kept sequence runs in this step: only sequences behind it in the queue
+                # are preempted from here on.
+                self._cache_filled_blocks(seq)
                 kept.append(seq)
             else:
                 self._preempt(seq)
@@ -257,13 +272,9 @@ class Scheduler:
         self._waiting.appendleft(seq)
         self._num_preemptions += 1
 
-    def _update_running(self) -> None:
-        """Offers the blocks computed at the last step to the prefix cache, then frees the
-        blocks of finished sequences."""
+    def _release_finished(self) -> None:
         still_running: list[Sequence] = []
         for seq in self._running:
-            # Before freeing, so that a finished or aborted sequence's blocks are cached too.
-            self._cache_computed_blocks(seq)
             if seq.is_finished:
                 self._blocks.free(seq.block_table)
             else:
