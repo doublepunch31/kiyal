@@ -145,19 +145,38 @@ def tiny_tokenizer(tiny_tokenizer_dir: Path) -> Tokenizer:
 
 
 @pytest.fixture(scope="session")
-def tiny_model_dir(
+def make_tiny_model_dir(
     make_tiny_checkpoint: Callable[..., Path],
     tiny_tokenizer_dir: Path,
     tiny_tokenizer: Tokenizer,
     tmp_path_factory: pytest.TempPathFactory,
-) -> Path:
+) -> Callable[..., Path]:
+    """Returns a function that writes a tiny random model with the tiny tokenizer it is sized
+    for into a new directory. Keyword arguments override fields of TINY_CONFIG."""
+
+    def make(**overrides: object) -> Path:
+        checkpoint = make_tiny_checkpoint(
+            vocab_size=tiny_tokenizer.vocab_size,
+            bos_token_id=tiny_tokenizer.bos_token_id,
+            eos_token_id=tiny_tokenizer.eos_token_id,
+            **overrides,
+        )
+        model_dir = tmp_path_factory.mktemp("tiny-model")
+        shutil.copytree(checkpoint, model_dir, dirs_exist_ok=True)
+        shutil.copytree(tiny_tokenizer_dir, model_dir, dirs_exist_ok=True)
+        return model_dir
+
+    return make
+
+
+@pytest.fixture(scope="session")
+def tiny_model_dir(make_tiny_model_dir: Callable[..., Path]) -> Path:
     """Directory holding a tiny random model and the tiny tokenizer it is sized for."""
-    checkpoint = make_tiny_checkpoint(
-        vocab_size=tiny_tokenizer.vocab_size,
-        bos_token_id=tiny_tokenizer.bos_token_id,
-        eos_token_id=tiny_tokenizer.eos_token_id,
-    )
-    model_dir = tmp_path_factory.mktemp("tiny-model")
-    shutil.copytree(checkpoint, model_dir, dirs_exist_ok=True)
-    shutil.copytree(tiny_tokenizer_dir, model_dir, dirs_exist_ok=True)
-    return model_dir
+    return make_tiny_model_dir()
+
+
+@pytest.fixture(scope="session")
+def tiny_long_model_dir(make_tiny_model_dir: Callable[..., Path]) -> Path:
+    """The tiny model with a context of 2048 positions. A request that fills it takes
+    hundreds of milliseconds on a CPU, so tests can act on it while it runs."""
+    return make_tiny_model_dir(max_position_embeddings=2048)

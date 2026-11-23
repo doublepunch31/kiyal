@@ -84,7 +84,9 @@ class LLMEngine:
                 f"pool more blocks or memory, or lower max_model_len"
             )
         self._runner = ModelRunner(model, num_blocks, config.block_size)
-        self._scheduler = Scheduler(config, BlockManager(num_blocks, config.block_size, watermark))
+        self._blocks = BlockManager(num_blocks, config.block_size, watermark)
+        self._scheduler = Scheduler(config, self._blocks)
+        self._max_model_len = max_len
         self._vocab_size = model.config.vocab_size
         self._device = model.embed_tokens.weight.device
         # Unfinished requests by id.
@@ -127,17 +129,27 @@ class LLMEngine:
         self._requests[request_id] = seq
         return request_id
 
-    def abort(self, request_id: str) -> None:
+    def abort(self, request_id: str) -> bool:
         """Ends a request at once and frees its place in the batch.
 
         Unknown and finished requests are ignored, since a request can finish between the
         caller's decision and this call.
+
+        Returns:
+            Whether an unfinished request was aborted.
         """
-        if self._scheduler.abort(request_id) is not None:
-            del self._requests[request_id]
+        if self._scheduler.abort(request_id) is None:
+            return False
+        del self._requests[request_id]
+        return True
 
     def has_unfinished(self) -> bool:
         return self._scheduler.has_unfinished()
+
+    @property
+    def max_model_len(self) -> int:
+        """The most prompt and output tokens one request can hold."""
+        return self._max_model_len
 
     @property
     def num_running(self) -> int:
@@ -145,9 +157,19 @@ class LLMEngine:
         return self._scheduler.num_running
 
     @property
+    def num_waiting(self) -> int:
+        """Requests waiting to start, including preempted ones."""
+        return self._scheduler.num_waiting
+
+    @property
     def num_kv_blocks(self) -> int:
         """Blocks of the KV pool."""
         return self._runner.pool.num_blocks
+
+    @property
+    def num_free_kv_blocks(self) -> int:
+        """Blocks of the KV pool that no request holds, cached ones included."""
+        return self._blocks.num_free_blocks
 
     @property
     def num_preemptions(self) -> int:

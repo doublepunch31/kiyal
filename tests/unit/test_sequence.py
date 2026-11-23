@@ -170,9 +170,11 @@ def test_finish_records_the_reason(factory: SequenceFactory) -> None:
     [
         ([], "the prompt has no tokens"),
         ([5] * MAX_LEN, "has 12 tokens, but the context of 12 tokens must also fit"),
+        ([5, -1], r"the prompt has token ids outside \[0, 320\)"),
+        ([5, 320], r"the prompt has token ids outside \[0, 320\)"),
     ],
 )
-def test_prompts_without_room_for_output_raise(
+def test_prompts_that_cannot_run_raise(
     factory: SequenceFactory, prompt: list[int], message: str
 ) -> None:
     with pytest.raises(ValueError, match=message):

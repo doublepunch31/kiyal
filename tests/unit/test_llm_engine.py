@@ -135,6 +135,21 @@ def test_requests_that_outgrow_the_pool_generate_what_they_generate_alone(
     assert [c.text for c in together] == [c.text for c in alone]
 
 
+def test_the_engine_reports_waiting_requests_and_free_blocks(
+    model: LlamaModel, tiny_tokenizer: Tokenizer, prompts: list[list[int]]
+) -> None:
+    config = EngineConfig(max_num_seqs=1, block_size=4, num_kv_blocks=64)
+    engine = LLMEngine(model, tiny_tokenizer, config)
+    assert engine.max_model_len == model.config.max_position_embeddings
+    assert (engine.num_waiting, engine.num_free_kv_blocks) == (0, 64)
+    engine.add_request(prompts[0], GREEDY)
+    engine.add_request(prompts[1], GREEDY)
+    assert engine.num_waiting == 2
+    engine.step()
+    assert engine.num_waiting == 1
+    assert engine.num_free_kv_blocks == 64 - -(-len(prompts[0]) // 4)
+
+
 def test_the_engine_counts_the_requests_in_the_batch(
     engine: LLMEngine, prompts: list[list[int]]
 ) -> None:
@@ -276,12 +291,12 @@ def test_aborting_a_request_frees_its_place(
     first = engine.add_request(prompts[0], GREEDY)
     second = engine.add_request(prompts[1], GREEDY)
     engine.step()
-    engine.abort(first)
+    assert engine.abort(first)
     assert [o.request_id for o in engine.step()] == [second]
     # Aborting again, or an unknown request, does nothing.
-    engine.abort(first)
-    engine.abort("unknown")
-    engine.abort(second)
+    assert not engine.abort(first)
+    assert not engine.abort("unknown")
+    assert engine.abort(second)
     assert not engine.has_unfinished()
     assert engine.step() == []
 

@@ -266,6 +266,7 @@ class SequenceFactory:
             )
         self._tokenizer = tokenizer
         self._max_len = max_len
+        self._vocab_size = config.vocab_size
         # config.json and the tokenizer can each name end-of-sequence tokens; any of them ends
         # the output.
         eos_token_ids = set(config.eos_token_id)
@@ -289,10 +290,15 @@ class SequenceFactory:
             name: How error messages refer to the prompt.
 
         Raises:
-            ValueError: If the prompt is empty or leaves no room for an output token.
+            ValueError: If the prompt is empty, has a token id outside the vocabulary, or
+                leaves no room for an output token.
         """
         if not prompt_token_ids:
             raise ValueError(f"{name} has no tokens")
+        # Checked here, before the model runs: an id outside the embedding table fails the
+        # lookup in the middle of a batch, and on CUDA it ends the whole process.
+        if min(prompt_token_ids) < 0 or max(prompt_token_ids) >= self._vocab_size:
+            raise ValueError(f"{name} has token ids outside [0, {self._vocab_size})")
         num_prompt = len(prompt_token_ids)
         if num_prompt >= self._max_len:
             raise ValueError(
