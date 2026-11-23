@@ -4,7 +4,7 @@ import time
 import uuid
 from collections import abc
 from http import HTTPStatus
-from typing import Final
+from typing import Final, Protocol
 
 from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -15,7 +15,7 @@ from starlette.exceptions import HTTPException
 from starlette.types import Receive, Scope, Send
 
 from kiyal import __version__
-from kiyal.engine.async_engine import AsyncEngine, EngineStoppedError
+from kiyal.engine.async_engine import EngineStats, EngineStoppedError
 from kiyal.engine.sequence import RequestOutput, SamplingParams
 from kiyal.server.metrics import Metrics
 from kiyal.server.protocol import (
@@ -67,13 +67,38 @@ class APIError(Exception):
         return _json(self.body(), self.status_code, headers)
 
 
-def build_app(engine: AsyncEngine, tokenizer: Tokenizer, model_name: str) -> FastAPI:
+class ServingEngine(Protocol):
+    """What the app needs from an engine.
+
+    Kiyal serves with `AsyncEngine`. The benchmarks serve baseline engines through the same
+    app, so that every engine they compare gets the same HTTP handling.
+    """
+
+    @property
+    def is_running(self) -> bool: ...
+
+    @property
+    def max_model_len(self) -> int: ...
+
+    def stats(self) -> EngineStats: ...
+
+    def start(self) -> None: ...
+
+    def shutdown(self) -> None: ...
+
+    def generate(
+        self, request_id: str, prompt_token_ids: abc.Sequence[int], params: SamplingParams
+    ) -> abc.AsyncGenerator[RequestOutput, None]: ...
+
+
+def build_app(engine: ServingEngine, tokenizer: Tokenizer, model_name: str) -> FastAPI:
     """Builds the HTTP API around an engine.
 
-    The app starts the engine's step loop when it starts and stops it when it shuts down.
+    The app starts the engine when it starts and stops it when it shuts down.
 
     Args:
-        engine: The engine that generates the outputs, not started yet.
+        engine: The engine that generates the outputs, not started yet. Its methods behave
+            as `AsyncEngine`'s do.
         tokenizer: Encodes prompts. Give the app its own instance rather than the one the
             engine decodes with: the app tokenizes on the event loop's thread while the
             engine decodes on its own, and one instance is not safe to share across
@@ -95,7 +120,7 @@ def build_app(engine: AsyncEngine, tokenizer: Tokenizer, model_name: str) -> Fas
 
 
 class _Server:
-    def __init__(self, engine: AsyncEngine, tokenizer: Tokenizer, model_name: str) -> None:
+    def __init__(self, engine: ServingEngine, tokenizer: Tokenizer, model_name: str) -> None:
         self._engine = engine
         self._tokenizer = tokenizer
         self._model_name = model_name
