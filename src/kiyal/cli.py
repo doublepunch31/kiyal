@@ -3,11 +3,17 @@ import sys
 import time
 from collections.abc import Sequence
 
+import uvicorn
+
 from kiyal import __version__
+from kiyal.config import EngineConfig
 from kiyal.device import DeviceUnavailableError, resolve_device, resolve_dtype
+from kiyal.engine.async_engine import AsyncEngine
 from kiyal.engine.generator import TextGenerator
+from kiyal.engine.llm_engine import LLMEngine
 from kiyal.engine.sequence import SamplingParams
 from kiyal.model.loader import CheckpointError, load_model, resolve_model_dir
+from kiyal.server.app import build_app
 from kiyal.tokenizer import Tokenizer, TokenizerError
 
 
@@ -26,12 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Generates text for one prompt and prints it as it is produced.",
     )
     generate.add_argument("prompt", help="text to continue, or the user message of a chat")
-    generate.add_argument(
-        "--model", required=True, help="local checkpoint directory or Hugging Face repo id"
-    )
-    generate.add_argument("--revision", help="branch, tag or commit of a Hugging Face repo")
-    generate.add_argument("--device", default="auto", help="auto, cuda, cuda:N, mps or cpu")
-    generate.add_argument("--dtype", default="auto", help="auto, fp32, fp16 or bf16")
+    _add_model_arguments(generate)
     generate.add_argument(
         "--raw",
         action="store_true",
@@ -60,7 +61,80 @@ def build_parser() -> argparse.ArgumentParser:
         "--stop", action="append", default=[], help="string that ends the output; repeatable"
     )
     generate.set_defaults(run=_run_generate)
+
+    engine_defaults = EngineConfig()
+    serve = commands.add_parser(
+        "serve",
+        help="serve a model over an OpenAI-compatible HTTP API",
+        description="Serves a model over an OpenAI-compatible HTTP API.",
+    )
+    _add_model_arguments(serve)
+    serve.add_argument("--host", default="127.0.0.1", help="address to listen on")
+    serve.add_argument("--port", type=int, default=8000, help="port to listen on")
+    serve.add_argument(
+        "--served-model-name", help="name clients give in the model field (default: --model)"
+    )
+    serve.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=engine_defaults.max_num_seqs,
+        help="most requests in the batch at once",
+    )
+    serve.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=engine_defaults.max_num_batched_tokens,
+        help="most prompt tokens that start in one step, and the longest prompt",
+    )
+    serve.add_argument(
+        "--max-model-len",
+        type=int,
+        default=engine_defaults.max_model_len,
+        help="most prompt and output tokens of one request",
+    )
+    serve.add_argument(
+        "--block-size",
+        type=int,
+        default=engine_defaults.block_size,
+        help="tokens per block of the KV cache",
+    )
+    serve.add_argument(
+        "--num-kv-blocks", type=int, help="blocks of the KV cache (default: sized from memory)"
+    )
+    serve.add_argument(
+        "--kv-cache-gb",
+        type=float,
+        default=engine_defaults.kv_cache_gb,
+        help="memory of the KV cache on the CPU and MPS, in GiB",
+    )
+    serve.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=engine_defaults.gpu_memory_utilization,
+        help="share of CUDA memory for the weights, activations and KV cache",
+    )
+    serve.add_argument(
+        "--no-prefix-caching",
+        action="store_true",
+        help="do not share the KV blocks of common prompt prefixes between requests",
+    )
+    serve.add_argument(
+        "--log-level",
+        default="info",
+        choices=["critical", "error", "warning", "info", "debug"],
+        help="log level of the HTTP server",
+    )
+    serve.set_defaults(run=_run_serve)
     return parser
+
+
+def _add_model_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--model", required=True, help="local checkpoint directory or Hugging Face repo id"
+    )
+    parser.add_argument("--revision", help="branch, tag or commit of a Hugging Face repo")
+    parser.add_argument("--device", default="auto", help="auto, cuda, cuda:N, mps or cpu")
+    parser.add_argument("--dtype", default="auto", help="auto, fp32, fp16 or bf16")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -126,6 +200,37 @@ def _run_generate(args: argparse.Namespace) -> int:
         f"finish reason: {reason}",
         file=sys.stderr,
     )
+    return 0
+
+
+def _run_serve(args: argparse.Namespace) -> int:
+    config = EngineConfig(
+        max_num_seqs=args.max_num_seqs,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        max_model_len=args.max_model_len,
+        block_size=args.block_size,
+        num_kv_blocks=args.num_kv_blocks,
+        enable_prefix_caching=not args.no_prefix_caching,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        kv_cache_gb=args.kv_cache_gb,
+    )
+    device = resolve_device(args.device)
+    dtype = resolve_dtype(args.dtype, device)
+    model_dir = resolve_model_dir(args.model, revision=args.revision)
+    model = load_model(model_dir, device=device, dtype=dtype)
+    engine = LLMEngine(model, Tokenizer.from_dir(model_dir), config)
+    print(
+        f"kiyal: {engine.num_kv_blocks} KV blocks of {config.block_size} tokens, "
+        f"up to {engine.max_model_len} tokens per request, on {device} in "
+        f"{str(dtype).removeprefix('torch.')}",
+        file=sys.stderr,
+    )
+    # A second tokenizer for the server, which encodes prompts on another thread than the
+    # one where the engine decodes outputs.
+    app = build_app(
+        AsyncEngine(engine), Tokenizer.from_dir(model_dir), args.served_model_name or args.model
+    )
+    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
     return 0
 
 

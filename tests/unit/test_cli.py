@@ -1,8 +1,11 @@
 import shutil
 from pathlib import Path
 
+import httpx
 import pytest
 import torch
+import uvicorn
+from fastapi import FastAPI
 
 from kiyal import __version__
 from kiyal.cli import main
@@ -10,6 +13,7 @@ from kiyal.engine.generator import TextGenerator
 from kiyal.engine.sequence import SamplingParams
 from kiyal.model.loader import load_model
 from kiyal.tokenizer import Tokenizer
+from tests.server.serving import serving
 
 
 def test_help_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
@@ -170,3 +174,45 @@ def test_generate_requires_a_model(capsys: pytest.CaptureFixture[str]) -> None:
         main(["generate", "the cat"])
     assert exc_info.value.code == 2
     assert "--model" in capsys.readouterr().err
+
+
+def test_serve_runs_the_app_with_the_given_settings(
+    tiny_model_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    served: list[object] = []
+
+    def run(app: FastAPI, *, host: str, port: int, log_level: str) -> None:
+        served.append((host, port, log_level))
+        with serving(app) as base_url:
+            served.append(httpx.get(f"{base_url}/v1/models").json()["data"][0]["id"])
+
+    monkeypatch.setattr(uvicorn, "run", run)
+    args = [
+        *["serve", "--model", str(tiny_model_dir), "--device", "cpu", "--dtype", "fp32"],
+        *["--port", "9000", "--served-model-name", "tiny", "--num-kv-blocks", "40"],
+        *["--block-size", "4", "--log-level", "warning"],
+    ]
+    assert main(args) == 0
+    assert served == [("127.0.0.1", 9000, "warning"), "tiny"]
+    assert "40 KV blocks of 4 tokens, up to 128 tokens per request" in capsys.readouterr().err
+
+
+def test_serve_names_the_model_by_its_path_by_default(
+    tiny_model_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    served: list[str] = []
+
+    def run(app: FastAPI, **kwargs: object) -> None:
+        with serving(app) as base_url:
+            served.append(httpx.get(f"{base_url}/v1/models").json()["data"][0]["id"])
+
+    monkeypatch.setattr(uvicorn, "run", run)
+    assert main(["serve", "--model", str(tiny_model_dir), "--device", "cpu"]) == 0
+    assert served == [str(tiny_model_dir)]
+
+
+def test_serve_reports_invalid_engine_settings(
+    tiny_model_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["serve", "--model", str(tiny_model_dir), "--max-num-seqs", "0"]) == 1
+    assert "kiyal: error: max_num_seqs must be 1 or greater" in capsys.readouterr().err
