@@ -28,6 +28,11 @@ Early development. Implemented so far:
   request. When the blocks run out, the newest request gives its blocks up and is computed
   again later (preemption by recompute). The pool is sized from free memory on CUDA and from a
   set size on the CPU and MPS
+- prefix caching: each full block is known by a hash of its tokens and every token before them,
+  so a request whose prompt starts like an earlier one, such as a shared system prompt, shares
+  that request's blocks and runs only the rest of its prompt. Blocks that no request holds stay
+  cached until their memory is needed, the least recently used first, and requests that start
+  in the same step share the blocks the first of them computes
 - `kiyal generate`, which streams text decoded with the KV cache. The loop that recomputes the
   whole sequence at every step is kept as the baseline for tests and benchmarks.
 
@@ -35,7 +40,7 @@ On SmolLM2-135M-Instruct in fp32 on CPU, the model's logits match `transformers`
 greedy generation for a chat prompt gives the same tokens as `transformers`' `generate()`. Decoding
 with the KV cache gives the same tokens as decoding without it, and a static or continuous batch
 gives each prompt the same tokens as decoding it alone, also when the paged cache preempts and
-recomputes requests. The server is not implemented yet.
+recomputes requests and when requests share cached prefixes. The server is not implemented yet.
 
 ## Setup
 
@@ -71,9 +76,9 @@ uv run kiyal generate --model HuggingFaceTB/SmolLM2-135M-Instruct \
 
 ## Benchmarks
 
-All numbers below were measured on a laptop (Apple M4): the KV cache and static batching runs
-on battery power, the continuous batching and paged cache runs on AC power. None are NVIDIA GPU
-numbers.
+All numbers below were measured on a laptop (Apple M4): the KV cache, static batching and prefix
+caching runs on battery power, the continuous batching and paged cache runs on AC power. None
+are NVIDIA GPU numbers.
 
 ### KV cache
 
@@ -230,6 +235,53 @@ ratio is uncertain. The request counts and preemptions are the same on both devi
 every run: each request makes exactly its output length, so the schedule does not depend on
 timing or on the tokens generated.
 
+### Prefix caching
+
+16 requests, each made of the same system prompt of 250 to 2000 tokens and a user turn of 16 to
+64 random tokens, with 16 greedy output tokens each. Every run starts a new engine, so the first
+request computes the system prompt; with the cache, the others share its blocks and run only
+the tokens after them. The requests arrive either one at a time, each when the one before it has
+ended, or all at once. Median of 3 runs. The hit rate is the share of prompt tokens whose keys
+and values came from the cache.
+
+On the M4 GPU through MPS (fp16), TTFT in milliseconds:
+
+![Time to first token without and with prefix caching on the M4 GPU](benchmarks/results/prefix-mps.png)
+
+| system tokens | one at a time, without | one at a time, with | x | at once p50, without | at once p50, with | x | at once p99, without | at once p99, with | at once tokens/s, without | at once tokens/s, with | hit rate |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 250 | 54.1 | 23.2 | 2.3 | 528 | 208 | 2.5 | 659 | 208 | 253.4 | 461.6 | 77% |
+| 500 | 91.5 | 24.4 | 3.7 | 1120 | 342 | 3.3 | 1288 | 342 | 151.8 | 343.3 | 86% |
+| 1000 | 177.2 | 26.3 | 6.7 | 1527 | 835 | 1.8 | 2687 | 835 | 78.5 | 191.6 | 89% |
+| 2000 | 403.7 | 30.8 | 13.1 | 3575 | 2776 | 1.3 | 6341 | 2776 | 36.2 | 74.6 | 92% |
+
+One request at a time shows the cache alone: without it, the time to the first token grows with
+the system prompt, from 54 to 404 ms; with it, it stays between 23 and 31 ms, because a request
+runs only its own tokens and the part of the system prompt that does not fill a whole block. The
+first request of each run still computes the whole prompt.
+
+With all 16 requests at once, the cache lets every request start in the first step, since the
+shared tokens do not count against the step's token budget. The p99 drops 2.3 to 3.8 times and
+the throughput rises 1.8 to 2.4 times, but the median gain falls from 3.3 times at 500 tokens to
+1.3 times at 2000. The cause is the attention of that first step, not the cache: attention pads every request
+in a step to the longest one, so the 15 short requests each pay for the full prompt's queries.
+One 2048-token prefill took 393 ms; with 15 sequences of a single new token beside it, 2480 ms.
+One attention call per sequence, or a kernel for sequences of different lengths, would remove
+the padding.
+
+On the CPU (fp32, 4 threads), TTFT in milliseconds:
+
+| system tokens | one at a time, without | one at a time, with | x | at once p50, without | at once p50, with | x | at once p99, without | at once p99, with | at once tokens/s, without | at once tokens/s, with | hit rate |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 250 | 103.1 | 39.0 | 2.6 | 1093 | 546 | 2.0 | 1360 | 546 | 123.7 | 209.7 | 77% |
+| 500 | 191.6 | 43.9 | 4.4 | 2521 | 1030 | 2.4 | 2873 | 1030 | 68.8 | 132.8 | 86% |
+| 1000 | 484.1 | 63.1 | 7.7 | 3754 | 2768 | 1.4 | 6625 | 2768 | 31.3 | 61.4 | 89% |
+| 2000 | 1224.4 | 96.9 | 12.6 | 15117 | 16318 | 0.9 | 27407 | 16318 | 7.8 | 12.8 | 92% |
+
+On the CPU, where attention is a larger share of a step, the padded first step makes the
+median no better at 2000 tokens: 16.3 s with the cache, against runs of 13.0, 15.1 and 19.2 s
+without it.
+
 The result files, the CPU charts and the full tables are in
 [benchmarks/results/](benchmarks/results/).
 
@@ -255,7 +307,10 @@ prompt decoded alone with the KV cache, in the same way. Continuous batching is 
 requests arriving at random steps and in random order, each must again match its prompt decoded
 alone. The paged cache is the fourth, at block sizes from 1 token to the whole context (which is
 the contiguous pool of the previous step), and with pools small enough that requests are
-preempted and recomputed in every arrival order.
+preempted and recomputed in every arrival order. Prefix caching is the fifth: requests whose
+prompts share their first tokens in several ways, including a prompt that is a whole number of
+blocks and two equal prompts, must again match their prompts decoded alone, at block sizes 1, 4
+and 16, and with a pool small enough that requests are preempted and cached blocks evicted.
 
 ```sh
 # Single-request decoding speed at several output lengths, saved as JSON in benchmarks/raw/.
@@ -281,6 +336,12 @@ uv run python -m benchmarks.plot batching benchmarks/results/batching-cpu.json \
 uv run python -m benchmarks.capacity --model HuggingFaceTB/SmolLM2-135M-Instruct --device cpu
 uv run python -m benchmarks.plot capacity benchmarks/results/capacity-cpu.json \
     --output benchmarks/results/capacity-cpu
+
+# Time to first token with a shared system prompt of 250 to 2000 tokens, with and without prefix
+# caching, then the chart and table.
+uv run python -m benchmarks.prefix --model HuggingFaceTB/SmolLM2-135M-Instruct --device cpu
+uv run python -m benchmarks.plot prefix benchmarks/results/prefix-cpu.json \
+    --output benchmarks/results/prefix-cpu
 ```
 
 ## License

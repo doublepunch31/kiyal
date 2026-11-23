@@ -399,6 +399,90 @@ def test_the_capacity_table_compares_the_layouts_at_each_budget(layouts: plot.Re
     ]
 
 
+def prefix_result(ttft_ms: dict[int, tuple[float, float]]) -> plot.Result:
+    """A prefix caching result in the shape that benchmarks.prefix saves.
+
+    Args:
+        ttft_ms: Median TTFT one request at a time without and with the cache, per system
+            prompt length. Requests at once take 4 times as long at p50 and 6 times at p99.
+    """
+
+    def summary(ms: float, hit_rate: float) -> dict[str, float]:
+        return {
+            "ttft_p50_s": ms / 1000,
+            "ttft_p99_s": 1.5 * ms / 1000,
+            "output_tokens_per_s": 10_000 / ms,
+            "prefix_hit_rate": hit_rate,
+        }
+
+    def arrival(off_ms: float, on_ms: float, factor: float) -> dict[str, object]:
+        return {
+            "off": {"median": summary(factor * off_ms, 0.0)},
+            "on": {"median": summary(factor * on_ms, 0.9)},
+        }
+
+    return {
+        **batching_result({}),
+        "benchmark": "prefix",
+        "num_requests": 16,
+        "user_tokens": [16, 64],
+        "output_tokens": 16,
+        "results": [
+            {
+                "system_tokens": system_tokens,
+                "arrivals": {
+                    "one_at_a_time": arrival(off, on, 1.0),
+                    "all_at_once": arrival(off, on, 4.0),
+                },
+            }
+            for system_tokens, (off, on) in ttft_ms.items()
+        ],
+    }
+
+
+@pytest.fixture
+def prefixes() -> plot.Result:
+    return prefix_result({250: (50.0, 25.0), 1000: (200.0, 25.0)})
+
+
+def test_a_prefix_result_is_loaded(tmp_path: Path, prefixes: plot.Result) -> None:
+    assert plot.load_prefix_result(write(tmp_path / "p.json", prefixes)) == prefixes
+    with pytest.raises(ValueError, match="not a prefix caching result"):
+        plot.load_prefix_result(write(tmp_path / "b.json", batching_result({})))
+
+
+def test_the_prefix_table_compares_the_cache_off_and_on(prefixes: plot.Result) -> None:
+    lines = plot.prefix_table(prefixes).splitlines()
+    assert lines[0] == (
+        "| system tokens | one at a time, off p50 ms | one at a time, on p50 ms | x | "
+        "at once, off p50 ms | at once, on p50 ms | x | at once, off p99 ms | "
+        "at once, on p99 ms | at once, off tokens/s | at once, on tokens/s | hit rate |"
+    )
+    assert lines[2:] == [
+        "| 250 | 50.0 | 25.0 | 2.0 | 200 | 100 | 2.0 | 300 | 150 | 50.0 | 100.0 | 90% |",
+        "| 1000 | 200.0 | 25.0 | 8.0 | 800 | 100 | 8.0 | 1200 | 150 | 12.5 | 100.0 | 90% |",
+    ]
+
+
+def test_the_prefix_description_names_the_workload(prefixes: plot.Result) -> None:
+    assert plot.describe_prefix(prefixes) == (
+        "tiny-model, cpu float32, Test CPU, 16 requests of one system prompt and 16-64 other "
+        "tokens, 16 output tokens, greedy, median of 3 runs"
+    )
+
+
+def test_main_writes_the_prefix_chart_and_table(
+    tmp_path: Path, prefixes: plot.Result, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "prefix-cpu"
+    path = write(tmp_path / "p.json", prefixes)
+    assert plot.main(["prefix", str(path), "--output", str(output)]) == 0
+    chart, table = output.with_name("prefix-cpu.png"), output.with_name("prefix-cpu.md")
+    assert chart.read_bytes().startswith(PNG_SIGNATURE)
+    assert table.read_text() == f"{plot.describe_prefix(prefixes)}\n\n{plot.prefix_table(prefixes)}"
+    assert capsys.readouterr().out == f"saved {chart}\nsaved {table}\n"
+
+
 def test_main_writes_the_capacity_chart_and_table(
     tmp_path: Path, layouts: plot.Result, capsys: pytest.CaptureFixture[str]
 ) -> None:

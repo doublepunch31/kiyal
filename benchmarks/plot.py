@@ -37,6 +37,10 @@ BATCHING_LABELS = {"static": "static batching", "continuous": "continuous batchi
 # paged pool takes the next hue of the palette.
 CAPACITY_COLORS = {"contiguous": BATCHING_COLORS["continuous"], "paged": "#eda100"}
 CAPACITY_LABELS = {"contiguous": "contiguous", "paged": "paged"}
+# Without the cache is the paged engine of the capacity chart; with it takes the next slot of
+# the palette, magenta.
+PREFIX_COLORS = {"off": CAPACITY_COLORS["paged"], "on": "#e87ba4"}
+PREFIX_LABELS = {"off": "without prefix caching", "on": "with prefix caching"}
 SURFACE = "#fcfcfb"
 TEXT = "#0b0b0b"
 MUTED_TEXT = "#52514e"
@@ -529,6 +533,144 @@ def plot_capacity(result: Result, path: Path) -> Path:
     return path
 
 
+def load_prefix_result(path: Path) -> Result:
+    """Reads a prefix caching result file.
+
+    Raises:
+        ValueError: If the file is not a prefix caching result.
+    """
+    result = json.loads(path.read_text())
+    if result.get("benchmark") != "prefix":
+        raise ValueError(f"{path} is not a prefix caching result")
+    return result
+
+
+def prefix_medians(result: Result, arrival: str, cache: str, metric: str) -> dict[int, float]:
+    """Returns the median of a metric for each system prompt length of one arrival pattern
+    and cache setting in a prefix caching result."""
+    return {
+        entry["system_tokens"]: entry["arrivals"][arrival][cache]["median"][metric]
+        for entry in result["results"]
+    }
+
+
+def describe_prefix(result: Result) -> str:
+    """Returns one line naming the model, the machine and the workload of a prefix run."""
+    environment = result["environment"]
+    model = str(result["model"]).rsplit("/", 1)[-1]
+    hardware = environment.get("gpu") or environment["cpu"]
+    repeats = result["repeats"]
+    runs = "1 run" if repeats == 1 else f"median of {repeats} runs"
+    user_min, user_max = result["user_tokens"]
+    return (
+        f"{model}, {environment['device']} {environment['dtype']}, {hardware}, "
+        f"{result['num_requests']} requests of one system prompt and {user_min}-{user_max} "
+        f"other tokens, {result['output_tokens']} output tokens, greedy, {runs}"
+    )
+
+
+def prefix_table(result: Result) -> str:
+    """Renders a prefix caching result as a markdown table with one row per system prompt
+    length. TTFT is in milliseconds; "x" is the TTFT without the cache over the TTFT with
+    it."""
+    header = [
+        "system tokens",
+        "one at a time, off p50 ms",
+        "one at a time, on p50 ms",
+        "x",
+        "at once, off p50 ms",
+        "at once, on p50 ms",
+        "x",
+        "at once, off p99 ms",
+        "at once, on p99 ms",
+        "at once, off tokens/s",
+        "at once, on tokens/s",
+        "hit rate",
+    ]
+    lines = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
+    for entry in sorted(result["results"], key=lambda e: e["system_tokens"]):
+        alone = entry["arrivals"]["one_at_a_time"]
+        together = entry["arrivals"]["all_at_once"]
+        alone_off, alone_on = alone["off"]["median"], alone["on"]["median"]
+        off, on = together["off"]["median"], together["on"]["median"]
+        row = [
+            str(entry["system_tokens"]),
+            f"{alone_off['ttft_p50_s'] * 1000:.1f}",
+            f"{alone_on['ttft_p50_s'] * 1000:.1f}",
+            f"{alone_off['ttft_p50_s'] / alone_on['ttft_p50_s']:.1f}",
+            f"{off['ttft_p50_s'] * 1000:.0f}",
+            f"{on['ttft_p50_s'] * 1000:.0f}",
+            f"{off['ttft_p50_s'] / on['ttft_p50_s']:.1f}",
+            f"{off['ttft_p99_s'] * 1000:.0f}",
+            f"{on['ttft_p99_s'] * 1000:.0f}",
+            f"{off['output_tokens_per_s']:.1f}",
+            f"{on['output_tokens_per_s']:.1f}",
+            f"{on['prefix_hit_rate']:.0%}",
+        ]
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def plot_prefix(result: Result, path: Path) -> Path:
+    """Draws the time to first token against the system prompt length, without and with
+    prefix caching, for requests that arrive one at a time and all at once."""
+    figure = Figure(figsize=(10.5, 4.6), dpi=160, facecolor=SURFACE)
+    alone_axes, together_axes = figure.subplots(1, 2)
+    lengths = sorted(entry["system_tokens"] for entry in result["results"])
+    end_labels: list[tuple[int, float, str]] = []
+
+    def milliseconds(arrival: str, cache: str, metric: str) -> dict[int, float]:
+        return {n: s * 1000 for n, s in prefix_medians(result, arrival, cache, metric).items()}
+
+    for cache, color in PREFIX_COLORS.items():
+        label = PREFIX_LABELS[cache]
+        alone = milliseconds("one_at_a_time", cache, "ttft_p50_s")
+        _draw_series(alone_axes, alone, color, label, f"{alone[lengths[-1]]:,.0f} ms")
+        p50 = milliseconds("all_at_once", cache, "ttft_p50_s")
+        p99 = milliseconds("all_at_once", cache, "ttft_p99_s")
+        _draw_series(together_axes, p50, color, f"{label}, p50", None)
+        end_labels.append((lengths[-1], p50[lengths[-1]], f"{p50[lengths[-1]]:,.0f} ms"))
+        # p99 in the same color, told apart by dashes without markers.
+        slowest = _draw_series(together_axes, p99, color, f"{label}, p99", None)
+        slowest.set_linestyle("--")
+        slowest.set_marker("")
+
+    xlabel = "system prompt tokens shared by every request"
+    _style_axes(alone_axes, lengths, "Median time to first token, one request at a time", xlabel)
+    alone_axes.set_ylim(bottom=0)
+    alone_axes.legend(frameon=False, labelcolor=TEXT, loc="upper left", fontsize=9)
+    _style_axes(
+        together_axes,
+        lengths,
+        f"Time to first token, {result['num_requests']} requests at once",
+        xlabel,
+    )
+    together_axes.set_ylim(bottom=0)
+    _spread_end_labels(together_axes, end_labels)
+    # Long handles, so that the dashes show in the legend.
+    together_axes.legend(
+        frameon=False, labelcolor=TEXT, loc="upper left", fontsize=8, handlelength=3.5
+    )
+    for axes, arrival in ((alone_axes, "one_at_a_time"), (together_axes, "all_at_once")):
+        off = prefix_medians(result, arrival, "off", "ttft_p50_s")
+        on = prefix_medians(result, arrival, "on", "ttft_p50_s")
+        ratios = [f"{n} tokens x{off[n] / on[n]:.1f}" for n in (lengths[0], lengths[-1])]
+        axes.text(
+            0.0, 1.03, "p50 without over with the cache: " + ", ".join(dict.fromkeys(ratios)),
+            transform=axes.transAxes, color=MUTED_TEXT, fontsize=9, va="bottom",
+        )  # fmt: skip
+
+    figure.suptitle(
+        "Time to first token without and with prefix caching",
+        x=0.06, y=0.97, ha="left", color=TEXT, fontsize=13, fontweight="bold",
+    )  # fmt: skip
+    figure.text(0.06, 0.885, describe_prefix(result), color=MUTED_TEXT, fontsize=9)
+    figure.subplots_adjust(left=0.06, right=0.97, top=0.74, bottom=0.12, wspace=0.16)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path)
+    return path
+
+
 def _draw_series(
     axes: Axes, values: dict[int, float], color: str, label: str, end_label: str | None
 ) -> Line2D:
@@ -634,6 +776,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     capacity.add_argument(
         "--output", type=Path, required=True, help="path of the chart and table, without suffix"
     )
+    prefix = commands.add_parser("prefix", help="time to first token with prefix caching")
+    prefix.add_argument("result", type=Path, help="prefix caching result file")
+    prefix.add_argument(
+        "--output", type=Path, required=True, help="path of the chart and table, without suffix"
+    )
     args = parser.parse_args(argv)
 
     chart = args.output.with_name(args.output.name + ".png")
@@ -650,10 +797,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = load_batching_result(args.result)
         plot_batching(result, chart)
         table.write_text(f"{describe_batching(result)}\n\n{batching_table(result)}")
-    else:
+    elif args.command == "capacity":
         result = load_capacity_result(args.result)
         plot_capacity(result, chart)
         table.write_text(f"{describe_batching(result)}\n\n{capacity_table(result)}")
+    else:
+        result = load_prefix_result(args.result)
+        plot_prefix(result, chart)
+        table.write_text(f"{describe_prefix(result)}\n\n{prefix_table(result)}")
     print(f"saved {chart}")
     print(f"saved {table}")
     return 0

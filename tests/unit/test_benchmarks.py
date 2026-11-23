@@ -1,12 +1,15 @@
+import dataclasses
 import json
 import subprocess
+from functools import partial
 from pathlib import Path
 
 import pytest
 import torch
 
-from benchmarks import batching, capacity, latency, throughput
+from benchmarks import batching, capacity, latency, prefix, throughput
 from benchmarks.common import REPO_ROOT, capture_environment, median, percentile, save_result
+from benchmarks.latency import build_prompt
 from kiyal.config import EngineConfig
 from kiyal.engine.generator import TextGenerator
 from kiyal.engine.llm_engine import LLMEngine
@@ -490,6 +493,107 @@ def test_capacity_measures_both_layouts_at_each_budget(
         for summary in layouts.values():
             assert len(summary["runs"]) == 2
             assert summary["median"]["total_s"] == median([r["total_s"] for r in summary["runs"]])
+
+
+def prefix_settings(**overrides: object) -> prefix.Settings:
+    settings = prefix.Settings(
+        system_tokens=(20, 40),
+        num_requests=3,
+        user_tokens=(2, 5),
+        output_tokens=3,
+        seed=0,
+        max_num_batched_tokens=64,
+        repeats=2,
+        warmup=1,
+    )
+    return dataclasses.replace(settings, **overrides)
+
+
+def test_prefix_requests_share_only_the_system_prompt(tiny_tokenizer: Tokenizer) -> None:
+    workload = prefix.build_workload(tiny_tokenizer, 40, prefix_settings(num_requests=8))
+    system = build_prompt(tiny_tokenizer, 40)
+    assert all(prompt[:40] == system for prompt in workload.prompts)
+    assert all(2 <= len(prompt) - 40 <= 5 for prompt in workload.prompts)
+    assert len({tuple(prompt) for prompt in workload.prompts}) == 8
+    assert workload.output_tokens == [3] * 8
+
+
+def test_a_prefix_run_holds_every_request_without_sharing(tiny_tokenizer: Tokenizer) -> None:
+    workload = prefix.build_workload(tiny_tokenizer, 40, prefix_settings())
+    config = prefix.engine_config(workload, 64, cache=True)
+    assert config.enable_prefix_caching
+    assert config.max_num_seqs == 3
+    assert config.max_model_len == workload.max_len
+    assert config.num_kv_blocks == 3 * -(-workload.max_len // 16)
+    assert not prefix.engine_config(workload, 64, cache=False).enable_prefix_caching
+    with pytest.raises(ValueError, match="need a token budget of at least that, got 40"):
+        prefix.engine_config(workload, 40, cache=True)
+
+
+def test_requests_one_at_a_time_are_timed_from_when_each_is_added(
+    tiny_model: LlamaModel, tiny_tokenizer: Tokenizer
+) -> None:
+    workload = prefix.build_workload(tiny_tokenizer, 40, prefix_settings())
+    engine = LLMEngine(tiny_model, tiny_tokenizer, prefix.engine_config(workload, 64, cache=True))
+    timing = prefix.time_one_at_a_time(engine, workload, CPU)
+    assert len(timing.ttft_s) == len(timing.e2e_s) == 3
+    assert all(0 < ttft < e2e for ttft, e2e in zip(timing.ttft_s, timing.e2e_s, strict=True))
+    assert sum(timing.e2e_s) <= timing.total_s
+    assert timing.output_tokens == 9
+    # Two full blocks of the system prompt are shared by the second and third requests.
+    assert engine.num_prefix_hit_tokens == 2 * 32
+
+
+def test_a_prefix_run_starts_with_an_empty_cache(
+    tiny_model: LlamaModel, tiny_tokenizer: Tokenizer
+) -> None:
+    workload = prefix.build_workload(tiny_tokenizer, 40, prefix_settings())
+    prompt_tokens = sum(len(prompt) for prompt in workload.prompts)
+    for cache, hit_rate in [(True, 2 * 32 / prompt_tokens), (False, 0.0)]:
+        config = prefix.engine_config(workload, 64, cache)
+        for _ in range(2):
+            timer = partial(prefix.time_one_at_a_time, workload=workload, device=CPU)
+            summary = prefix.run_once(tiny_model, tiny_tokenizer, workload, config, timer)
+            assert summary["prefix_hit_rate"] == hit_rate
+            assert summary["preemptions"] == 0
+            assert summary["ttft_mean_s"] > 0
+
+
+def test_prefix_measures_both_arrivals_with_the_cache_off_and_on(
+    tiny_model: LlamaModel, tiny_tokenizer: Tokenizer
+) -> None:
+    results = prefix.measure(tiny_model, tiny_tokenizer, prefix_settings(), CPU)
+    assert [entry["system_tokens"] for entry in results] == [20, 40]
+    for entry in results:
+        arrivals = entry["arrivals"]
+        assert isinstance(arrivals, dict)
+        assert list(arrivals) == ["one_at_a_time", "all_at_once"]
+        for caches in arrivals.values():
+            assert list(caches) == ["off", "on"]
+            for name, summary in caches.items():
+                assert len(summary["runs"]) == 2
+                rate = summary["median"]["prefix_hit_rate"]
+                assert rate > 0 if name == "on" else rate == 0
+
+
+def test_prefix_main_saves_a_result_file(
+    tiny_model_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "prefix.json"
+    options = ["--device", "cpu", "--dtype", "fp32", "--num-requests", "3", "--repeats", "1"]
+    lengths = ["--system-tokens", "20", "--user-tokens", "2", "5", "--output-tokens", "3"]
+    args = ["--model", str(tiny_model_dir), *options, *lengths, "--warmup", "0"]
+    assert prefix.main([*args, "--max-num-batched-tokens", "64", "--output", str(output)]) == 0
+
+    result = json.loads(output.read_text())
+    assert result["benchmark"] == "prefix"
+    assert (result["user_tokens"], result["output_tokens"]) == ([2, 5], 3)
+    assert (result["num_requests"], result["seed"], result["repeats"]) == (3, 0, 1)
+    assert (result["block_size"], result["max_num_batched_tokens"]) == (16, 64)
+    assert [entry["system_tokens"] for entry in result["results"]] == [20]
+    printed = capsys.readouterr().out
+    assert "one_at_a_time" in printed
+    assert f"saved {output}" in printed
 
 
 def test_capacity_main_saves_a_result_file(
