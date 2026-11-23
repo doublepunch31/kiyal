@@ -68,7 +68,9 @@ def engine_config(
     The contiguous layout gives each sequence one block as long as the longest request, as
     the pool of continuous batching did before paging, and admits as many sequences as such
     blocks fit. The paged layout has blocks of 16 tokens and room in the batch for every
-    request, so that memory is its only limit.
+    request, so that memory is its only limit. Both run without prefix caching, which would
+    let every run after the first reuse the prompts of the one before, and a preempted
+    request reuse its own blocks.
 
     Raises:
         ValueError: If the layout is unknown, or the budget cannot hold the longest request.
@@ -84,6 +86,7 @@ def engine_config(
             max_model_len=max_len,
             block_size=max_len,
             num_kv_blocks=num_seqs,
+            enable_prefix_caching=False,
         )
     if layout == "paged":
         return EngineConfig(
@@ -92,6 +95,7 @@ def engine_config(
             max_model_len=max_len,
             block_size=PAGED_BLOCK_SIZE,
             num_kv_blocks=kv_tokens // PAGED_BLOCK_SIZE,
+            enable_prefix_caching=False,
         )
     raise ValueError(f"unknown layout {layout!r}; expected one of {', '.join(LAYOUTS)}")
 

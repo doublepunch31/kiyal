@@ -42,7 +42,9 @@ class LLMEngine:
     The tokens of all requests in a step go through the model flattened, one after
     another, so no compute goes to padding outside attention. Their keys and values live in
     a paged pool: each request takes blocks as its output grows, and when the blocks run
-    out, the newest request gives its blocks up and is computed again later.
+    out, the newest request gives its blocks up and is computed again later. With prefix
+    caching, a request whose prompt starts with the same tokens as an earlier one shares
+    that one's blocks for them and runs only the rest of its prompt.
     """
 
     def __init__(
@@ -151,6 +153,18 @@ class LLMEngine:
     def num_preemptions(self) -> int:
         """Times a request has given up its KV blocks so far."""
         return self._scheduler.num_preemptions
+
+    @property
+    def num_prefix_query_tokens(self) -> int:
+        """Prompt tokens of the requests started so far, with the outputs rerun after
+        preemption, while prefix caching is enabled."""
+        return self._scheduler.num_prefix_query_tokens
+
+    @property
+    def num_prefix_hit_tokens(self) -> int:
+        """Of those tokens, the ones whose keys and values were found in the prefix cache.
+        Divided by `num_prefix_query_tokens`, this is the cache's hit rate."""
+        return self._scheduler.num_prefix_hit_tokens
 
     @torch.inference_mode()
     def step(self) -> list[RequestOutput]:

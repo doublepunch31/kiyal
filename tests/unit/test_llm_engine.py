@@ -202,6 +202,21 @@ def test_the_model_runs_on_the_tokens_of_unfinished_requests_only(
     assert sizes == [len(prompts[0]) + len(prompts[1]), 2, 1, 1]
 
 
+def test_a_request_runs_only_the_prompt_tokens_after_its_cached_prefix(
+    model: LlamaModel, tiny_tokenizer: Tokenizer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = LLMEngine(model, tiny_tokenizer, EngineConfig(max_num_seqs=2, block_size=4))
+    shared = list(range(10, 22))
+    params = SamplingParams(max_tokens=3, temperature=0, ignore_eos=True)
+    engine.add_request([*shared, 30], params)
+    engine.step()
+    engine.add_request([*shared, 40, 41], params)
+    # The second prompt's three full blocks are those of the first, so 2 of its 14 tokens
+    # run, then both decode together.
+    assert forward_sizes(model, engine, monkeypatch) == [2, 2, 2]
+    assert (engine.num_prefix_query_tokens, engine.num_prefix_hit_tokens) == (27, 12)
+
+
 def test_generate_returns_each_prompts_completion(
     engine: LLMEngine, model: LlamaModel, tiny_tokenizer: Tokenizer, prompts: list[list[int]]
 ) -> None:

@@ -20,6 +20,9 @@ class EngineConfig:
             memory, at the risk of preemption when they grow.
         watermark: Share of the KV blocks that new sequences must leave free, so that the
             running ones can still grow right after an admission.
+        enable_prefix_caching: Lets a sequence share the KV blocks of an earlier one whose
+            tokens start the same way, such as a common system prompt, so its prefill starts
+            after them. Outputs are the same as without it, up to rounding.
         gpu_memory_utilization: Share of a CUDA device's memory that the weights, the
             activations of a step and the KV pool may use together.
         kv_cache_gb: Memory of the KV pool on the CPU and MPS, in GiB.
@@ -36,6 +39,7 @@ class EngineConfig:
     block_size: int = 16
     num_kv_blocks: int | None = None
     watermark: float = 0.01
+    enable_prefix_caching: bool = True
     gpu_memory_utilization: float = 0.85
     kv_cache_gb: float = 1.0
 

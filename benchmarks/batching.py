@@ -271,10 +271,13 @@ def measure(
     results: list[dict[str, object]] = []
     for batch_size in settings.batch_sizes:
         # One pool row per request in the batch, each long enough for the longest request.
+        # Without prefix caching, which would let every run after the first reuse the
+        # prompts of the one before.
         config = EngineConfig(
             max_num_seqs=batch_size,
             max_num_batched_tokens=settings.max_num_batched_tokens,
             max_model_len=workload.max_len,
+            enable_prefix_caching=False,
         )
         continuous = LLMEngine(model, tokenizer, config)
         runners: dict[str, Callable[[], RunTiming]] = {

@@ -27,15 +27,24 @@ TINY_PROMPT_LENGTHS = [1, 7, 40, 19, 25, 3]
 TINY_OUTPUT_LENGTHS = [30, 60, 12, 45, 20, 50]
 # 32 blocks of 4 hold one sequence of the tiny model's whole context of 128 tokens, less
 # than any four of these requests grow to. The token budget is below the longest requests,
-# so one that is preempted late restarts alone.
+# so one that is preempted late restarts alone. Prefix caching is off in this rung, so a
+# preempted request recomputes all its tokens; the prefix caching rung covers both.
 TINY_PREEMPT_CONFIG = EngineConfig(
-    max_num_seqs=4, max_num_batched_tokens=48, block_size=4, num_kv_blocks=32
+    max_num_seqs=4,
+    max_num_batched_tokens=48,
+    block_size=4,
+    num_kv_blocks=32,
+    enable_prefix_caching=False,
 )
 SMOLLM2_OUTPUT_LENGTHS = [64, 24, 48, 40]
 # 8 blocks of 16 hold one sequence of 128 tokens, less than any three of these requests
 # grow to.
 SMOLLM2_PREEMPT_CONFIG = EngineConfig(
-    max_num_seqs=3, max_num_batched_tokens=64, max_model_len=128, num_kv_blocks=8
+    max_num_seqs=3,
+    max_num_batched_tokens=64,
+    max_model_len=128,
+    num_kv_blocks=8,
+    enable_prefix_caching=False,
 )
 
 
@@ -49,7 +58,12 @@ def test_paged_logits_match_single_prompt_logits_on_the_tiny_model(
 ) -> None:
     model = tiny_model(make_tiny_checkpoint, tiny_tokenizer)
     prompts = random_prompts(model.config.vocab_size, TINY_PROMPT_LENGTHS)
-    config = EngineConfig(max_num_seqs=3, max_num_batched_tokens=48, block_size=block_size)
+    config = EngineConfig(
+        max_num_seqs=3,
+        max_num_batched_tokens=48,
+        block_size=block_size,
+        enable_prefix_caching=False,
+    )
     setup = Setup(model, tiny_tokenizer, config, TINY_ATOL)
     preemptions = assert_continuous_logits_match(setup, prompts, TINY_OUTPUT_LENGTHS)
     assert preemptions == [0, 0, 0]
@@ -73,7 +87,12 @@ def test_preempted_generation_matches_uninterrupted_generation_on_the_tiny_model
     params = [SamplingParams(max_tokens=n, temperature=0) for n in (64, 40, 64, 20)]
     # 20 blocks of 4 hold one sequence of 80 tokens, less than two of these requests use.
     config = EngineConfig(
-        max_num_seqs=2, max_num_batched_tokens=32, max_model_len=80, block_size=4, num_kv_blocks=20
+        max_num_seqs=2,
+        max_num_batched_tokens=32,
+        max_model_len=80,
+        block_size=4,
+        num_kv_blocks=20,
+        enable_prefix_caching=False,
     )
     preemptions = assert_same_generation(
         Setup(model, tiny_tokenizer, config, TINY_ATOL), prompts, params

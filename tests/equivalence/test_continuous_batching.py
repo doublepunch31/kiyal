@@ -31,10 +31,13 @@ TINY_ATOL = 2e-5
 SMOLLM2_ATOL = 1e-3
 # More prompts than places in the batch, so blocks are reused, and a token budget smaller
 # than all prompts together, so prompts that arrive together start in different steps.
-TINY_CONFIG = EngineConfig(max_num_seqs=3, max_num_batched_tokens=48)
+# Prefix caching is off in this rung and the paged one; its own rung turns it on.
+TINY_CONFIG = EngineConfig(max_num_seqs=3, max_num_batched_tokens=48, enable_prefix_caching=False)
 TINY_PROMPT_LENGTHS = [1, 7, 40, 19, 25, 3]
 TINY_OUTPUT_LENGTHS = [30, 60, 12, 45, 20, 50]
-SMOLLM2_CONFIG = EngineConfig(max_num_seqs=2, max_num_batched_tokens=64)
+SMOLLM2_CONFIG = EngineConfig(
+    max_num_seqs=2, max_num_batched_tokens=64, enable_prefix_caching=False
+)
 SMOLLM2_OUTPUT_LENGTHS = [64, 24, 48, 40]
 
 
@@ -55,7 +58,7 @@ def test_continuous_generation_matches_single_generation_on_the_tiny_model(
     prompts = [tiny_tokenizer.encode(text) for text in TINY_TEXTS.values()]
     # Outputs of different lengths, so requests leave the batch at different steps.
     params = [SamplingParams(max_tokens=n, temperature=0) for n in (64, 40, 64, 20)]
-    config = EngineConfig(max_num_seqs=2, max_num_batched_tokens=32)
+    config = EngineConfig(max_num_seqs=2, max_num_batched_tokens=32, enable_prefix_caching=False)
     assert_same_generation(Setup(model, tiny_tokenizer, config, TINY_ATOL), prompts, params)
 
 

@@ -31,8 +31,15 @@ def make_scheduler(
     max_num_batched_tokens: int = 64,
     num_blocks: int = 64,
     watermark: int = 0,
+    prefix_caching: bool = False,
 ) -> tuple[Scheduler, BlockManager]:
-    config = EngineConfig(max_num_seqs=max_num_seqs, max_num_batched_tokens=max_num_batched_tokens)
+    """Prefix caching is off by default: most tests use prompts of one repeated token, whose
+    blocks would all be shared."""
+    config = EngineConfig(
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=max_num_batched_tokens,
+        enable_prefix_caching=prefix_caching,
+    )
     blocks = BlockManager(num_blocks, BLOCK_SIZE, watermark)
     return Scheduler(config, blocks), blocks
 
@@ -41,11 +48,13 @@ def add(
     scheduler: Scheduler,
     factory: SequenceFactory,
     name: str,
-    prompt_len: int,
+    prompt: int | list[int],
     max_tokens: int = 8,
 ) -> Sequence:
+    """Queues a prompt of the given tokens, or of `prompt` copies of TOKEN."""
     params = SamplingParams(max_tokens=max_tokens, ignore_eos=True)
-    seq = factory.create(name, [TOKEN] * prompt_len, params)
+    prompt_ids = [TOKEN] * prompt if isinstance(prompt, int) else prompt
+    seq = factory.create(name, prompt_ids, params)
     scheduler.add(seq)
     return seq
 
@@ -355,3 +364,94 @@ def test_a_sequence_that_has_started_cannot_be_added(factory: SequenceFactory) -
     scheduler.schedule()
     with pytest.raises(ValueError, match="request a has already started"):
         scheduler.add(seq)
+
+
+# Ten distinct tokens: two full blocks of 4 and two tokens in a third block.
+PROMPT = list(range(100, 110))
+
+
+def test_a_sequence_starts_after_the_cached_prefix_of_a_running_one(
+    factory: SequenceFactory,
+) -> None:
+    scheduler, blocks = make_scheduler(prefix_caching=True)
+    first = add(scheduler, factory, "first", PROMPT)
+    run(scheduler.schedule())
+    # The same two full blocks, then other tokens.
+    second = add(scheduler, factory, "second", [*PROMPT[:8], 7, 8, 9])
+    output = scheduler.schedule()
+    assert names(output.prefills) == ["second"]
+    assert second.block_table[:2] == first.block_table[:2]
+    assert second.block_table[2] not in first.block_table
+    assert second.num_computed_tokens == 8
+    assert second.uncomputed_token_ids() == [7, 8, 9]
+    assert [blocks.ref_count(block) for block in second.block_table] == [2, 2, 1]
+    assert (scheduler.num_prefix_query_tokens, scheduler.num_prefix_hit_tokens) == (21, 8)
+
+
+def test_the_last_token_runs_even_when_every_block_before_it_is_cached(
+    factory: SequenceFactory,
+) -> None:
+    scheduler, _ = make_scheduler(prefix_caching=True)
+    first = add(scheduler, factory, "first", PROMPT[:8])
+    run(scheduler.schedule())
+    # Both blocks are cached, but the last token's logits are needed, so its block is
+    # computed again in a block of the second sequence's own.
+    second = add(scheduler, factory, "second", PROMPT[:8])
+    scheduler.schedule()
+    assert second.block_table[0] == first.block_table[0]
+    assert second.block_table[1] != first.block_table[1]
+    assert second.uncomputed_token_ids() == PROMPT[4:8]
+
+
+def test_blocks_are_cached_once_their_keys_and_values_are_computed(
+    factory: SequenceFactory,
+) -> None:
+    scheduler, _ = make_scheduler(prefix_caching=True)
+    first = add(scheduler, factory, "first", PROMPT)
+    # Starts in the same step as the first, so nothing is computed yet that it could share.
+    second = add(scheduler, factory, "second", PROMPT)
+    output = scheduler.schedule()
+    assert names(output.prefills) == ["first", "second"]
+    assert set(first.block_table).isdisjoint(second.block_table)
+    run(output)
+    # The cache holds the first sequence's blocks, not the second's copy of them.
+    third = add(scheduler, factory, "third", PROMPT)
+    scheduler.schedule()
+    assert third.block_table[:2] == first.block_table[:2]
+    assert scheduler.num_prefix_hit_tokens == 8
+
+
+def test_blocks_filled_by_generated_tokens_are_cached(factory: SequenceFactory) -> None:
+    scheduler, _ = make_scheduler(prefix_caching=True)
+    first = add(scheduler, factory, "first", PROMPT[:3], max_tokens=10)
+    # Six steps compute the keys and values of the prompt and of the first five generated
+    # tokens, which fill two blocks.
+    for _ in range(6):
+        run(scheduler.schedule())
+    assert first.num_computed_tokens == 8
+    second = add(scheduler, factory, "second", [*PROMPT[:3], *[TOKEN] * 5, 1])
+    scheduler.schedule()
+    assert second.block_table[:2] == first.block_table[:2]
+    assert second.num_computed_tokens == 8
+
+
+def test_cached_tokens_do_not_count_against_the_token_budget(factory: SequenceFactory) -> None:
+    scheduler, _ = make_scheduler(max_num_seqs=5, max_num_batched_tokens=12, prefix_caching=True)
+    add(scheduler, factory, "first", [*PROMPT, 1, 2])
+    run(scheduler.schedule())
+    # 11 tokens each, of which 3 run. Without the cache, one would start per step.
+    for name, suffix in zip("abcd", [[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]], strict=True):
+        add(scheduler, factory, name, PROMPT[:8] + suffix)
+    assert names(scheduler.schedule().prefills) == ["a", "b", "c", "d"]
+
+
+def test_without_prefix_caching_nothing_is_shared(factory: SequenceFactory) -> None:
+    scheduler, _ = make_scheduler()
+    first = add(scheduler, factory, "first", PROMPT)
+    run(scheduler.schedule())
+    second = add(scheduler, factory, "second", PROMPT)
+    scheduler.schedule()
+    assert set(first.block_table).isdisjoint(second.block_table)
+    assert second.num_computed_tokens == 0
+    assert (scheduler.num_prefix_query_tokens, scheduler.num_prefix_hit_tokens) == (0, 0)
+    assert first.block_hashes == second.block_hashes == []

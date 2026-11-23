@@ -2,7 +2,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
-from kiyal.cache.block_manager import BlockManager
+from kiyal.cache.block_manager import BlockManager, block_hash
 from kiyal.config import EngineConfig
 from kiyal.engine.sequence import FinishReason, Sequence, SequenceStatus
 
@@ -55,6 +55,11 @@ class Scheduler:
       again, its prompt and its output so far run as one prefill, which computes the lost
       keys and values again. At these model sizes that is cheaper than copying the blocks
       to host memory and back, and it needs no second pool.
+    - Prefix caching, when enabled. Once a full block's keys and values are computed, the
+      block is cached under the hash of its tokens and all tokens before them. A starting
+      sequence shares the cached blocks of its longest matching prefix and runs only the
+      tokens after it, which also count against the token budget. A cached block is never
+      written to, so its keys and values stay those of the tokens it was cached for.
 
     The scheduler hands out KV blocks and takes them back. It never runs the model and
     does not add tokens; the engine does both and reports finished sequences through their
@@ -70,6 +75,8 @@ class Scheduler:
         # behind it starts before it does.
         self._running: list[Sequence] = []
         self._num_preemptions = 0
+        self._num_prefix_query_tokens = 0
+        self._num_prefix_hit_tokens = 0
 
     @property
     def num_waiting(self) -> int:
@@ -83,6 +90,17 @@ class Scheduler:
     def num_preemptions(self) -> int:
         """Times a running sequence has given up its blocks so far."""
         return self._num_preemptions
+
+    @property
+    def num_prefix_query_tokens(self) -> int:
+        """Tokens of the sequences started so far, restarts included, while prefix caching
+        is enabled."""
+        return self._num_prefix_query_tokens
+
+    @property
+    def num_prefix_hit_tokens(self) -> int:
+        """Of those tokens, the ones whose keys and values were found in the prefix cache."""
+        return self._num_prefix_hit_tokens
 
     def has_unfinished(self) -> bool:
         return bool(self._waiting) or any(not seq.is_finished for seq in self._running)
@@ -107,14 +125,14 @@ class Scheduler:
     def schedule(self) -> SchedulerOutput:
         """Picks the sequences of the next step.
 
-        Sequences that finished since the last step leave the batch first, and their KV
-        blocks become free.
+        Blocks filled at the last step join the prefix cache first. Then the sequences that
+        finished leave the batch, and their KV blocks become free.
 
         Returns:
             Prefills if a waiting sequence fits, otherwise a decode of every running
             sequence that keeps its blocks. Empty when nothing is left to run.
         """
-        self._release_finished()
+        self._update_running()
         prefills = self._admit()
         if prefills:
             return SchedulerOutput(prefills=prefills, decodes=[])
@@ -135,7 +153,7 @@ class Scheduler:
         for seq in self._running:
             if seq.request_id == request_id and not seq.is_finished:
                 seq.finish(FinishReason.ABORT)
-                self._release_finished()
+                self._update_running()
                 return seq
         return None
 
@@ -145,23 +163,64 @@ class Scheduler:
         budget = self._config.max_num_batched_tokens
         while self._waiting and len(self._running) < self._config.max_num_seqs:
             seq = self._waiting[0]
-            num_tokens = seq.num_tokens - seq.num_computed_tokens
+            cached_blocks = self._cached_prefix(seq)
+            num_cached_tokens = len(cached_blocks) * self._blocks.block_size
+            num_new_tokens = seq.num_tokens - num_cached_tokens
             # Only a preempted sequence can be longer than the whole budget, since it
             # reruns its output too. It starts alone: without chunked prefill it could
             # never start otherwise.
-            if num_tokens > budget and prefills:
+            if num_new_tokens > budget and prefills:
                 break
-            if not self._blocks.can_allocate(seq.num_tokens):
+            if not self._blocks.can_allocate(seq.num_tokens, cached_blocks):
                 break
             self._waiting.popleft()
-            seq.block_table = self._blocks.allocate(seq.num_tokens)
+            seq.block_table = self._blocks.allocate(seq.num_tokens, cached_blocks)
+            seq.num_computed_tokens = num_cached_tokens
+            seq.num_cached_blocks = len(cached_blocks)
             seq.status = SequenceStatus.RUNNING
             if seq.first_scheduled_time is None:
                 seq.first_scheduled_time = time.perf_counter()
+            if self._config.enable_prefix_caching:
+                self._num_prefix_query_tokens += seq.num_tokens
+                self._num_prefix_hit_tokens += num_cached_tokens
             self._running.append(seq)
             prefills.append(seq)
-            budget -= num_tokens
+            budget -= num_new_tokens
         return prefills
+
+    def _cached_prefix(self, seq: Sequence) -> list[int]:
+        """Returns the cached blocks that hold the start of a waiting sequence's tokens."""
+        if not self._config.enable_prefix_caching:
+            return []
+        # The last token always runs, because its logits give the next token. So the shared
+        # prefix ends before it, and the block that the last token is written to is the
+        # sequence's own, even when every block before it is cached.
+        num_blocks = (seq.num_tokens - 1) // self._blocks.block_size
+        return self._blocks.cached_prefix(self._block_hashes(seq, num_blocks)[:num_blocks])
+
+    def _block_hashes(self, seq: Sequence, num_blocks: int) -> list[bytes]:
+        """Hashes the sequence's first `num_blocks` full blocks where not done yet, and
+        returns all its block hashes."""
+        hashes = seq.block_hashes
+        if len(hashes) < num_blocks:
+            size = self._blocks.block_size
+            token_ids = seq.prompt_token_ids + seq.output_token_ids
+            for index in range(len(hashes), num_blocks):
+                parent = hashes[-1] if hashes else None
+                hashes.append(block_hash(parent, token_ids[index * size : (index + 1) * size]))
+        return hashes
+
+    def _cache_computed_blocks(self, seq: Sequence) -> None:
+        """Offers the sequence's full blocks computed since the last offer to the cache."""
+        if not self._config.enable_prefix_caching:
+            return
+        num_full = seq.num_computed_tokens // self._blocks.block_size
+        if num_full <= seq.num_cached_blocks:
+            return
+        hashes = self._block_hashes(seq, num_full)
+        for index in range(seq.num_cached_blocks, num_full):
+            self._blocks.cache_block(seq.block_table[index], hashes[index])
+        seq.num_cached_blocks = num_full
 
     def _grow_running(self) -> list[Sequence]:
         """Makes room for one more token of every running sequence, oldest first.
@@ -191,15 +250,20 @@ class Scheduler:
     def _preempt(self, seq: Sequence) -> None:
         self._blocks.free(seq.block_table)
         seq.num_computed_tokens = 0
+        seq.num_cached_blocks = 0
         seq.status = SequenceStatus.PREEMPTED
         # Ahead of the sequences that arrived later. Of several preempted in one step, the
         # newest goes first and so ends up behind the others.
         self._waiting.appendleft(seq)
         self._num_preemptions += 1
 
-    def _release_finished(self) -> None:
+    def _update_running(self) -> None:
+        """Offers the blocks computed at the last step to the prefix cache, then frees the
+        blocks of finished sequences."""
         still_running: list[Sequence] = []
         for seq in self._running:
+            # Before freeing, so that a finished or aborted sequence's blocks are cached too.
+            self._cache_computed_blocks(seq)
             if seq.is_finished:
                 self._blocks.free(seq.block_table)
             else:

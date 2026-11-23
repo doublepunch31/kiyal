@@ -1,3 +1,5 @@
+import dataclasses
+
 import pytest
 
 from kiyal.config import EngineConfig
@@ -7,6 +9,7 @@ def test_the_defaults_are_valid() -> None:
     config = EngineConfig()
     assert config.max_num_batched_tokens >= config.max_num_seqs >= 1
     assert config.max_model_len >= 1
+    assert config.enable_prefix_caching
 
 
 @pytest.mark.parametrize(
@@ -15,7 +18,7 @@ def test_the_defaults_are_valid() -> None:
 )
 def test_limits_below_1_raise(name: str) -> None:
     with pytest.raises(ValueError, match=f"{name} must be 1 or greater, got 0"):
-        EngineConfig(**{name: 0})
+        dataclasses.replace(EngineConfig(), **{name: 0})
 
 
 def test_a_decode_step_must_fit_in_the_token_budget() -> None:

@@ -135,6 +135,12 @@ class Sequence:
         num_computed_tokens: Tokens whose keys and values are in the KV cache.
         block_table: Blocks of the KV pool that hold the sequence's tokens, in order, while
             it runs. Empty otherwise.
+        block_hashes: Content hash of each full block of the sequence's tokens that has
+            been hashed so far, in order, for prefix caching. Kept through preemption, since
+            the tokens do not change.
+        num_cached_blocks: Blocks at the start of `block_table` that the prefix cache has
+            been offered: their keys and values are computed, and the cache holds them or
+            another block with the same tokens.
         arrival_time: When the request was added, from `time.perf_counter()`, like the
             other times.
         first_scheduled_time: When the sequence first entered the batch, not counting
@@ -156,6 +162,8 @@ class Sequence:
     finish_reason: FinishReason | None = None
     num_computed_tokens: int = 0
     block_table: list[int] = field(default_factory=list[int])
+    block_hashes: list[bytes] = field(default_factory=list[bytes])
+    num_cached_blocks: int = 0
     arrival_time: float = field(default_factory=time.perf_counter)
     first_scheduled_time: float | None = None
     first_token_time: float | None = None
@@ -175,7 +183,8 @@ class Sequence:
         """Tokens whose keys and values are not in the KV cache yet, in order.
 
         That is the prompt before the sequence first runs, then the latest output token.
-        After a preemption it is the prompt and the whole output again.
+        After a preemption it is the prompt and the whole output again. A prefix found in
+        the prefix cache is left out in both cases.
         """
         num_prompt = len(self.prompt_token_ids)
         if self.num_computed_tokens < num_prompt:

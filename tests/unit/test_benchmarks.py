@@ -420,6 +420,7 @@ def test_the_contiguous_layout_reserves_the_longest_request_per_sequence(
     config = capacity.engine_config("contiguous", 3 * workload.max_len + 1, workload, 64)
     assert (config.max_num_seqs, config.num_kv_blocks) == (3, 3)
     assert config.block_size == config.max_model_len == workload.max_len
+    assert not config.enable_prefix_caching
 
 
 def test_the_paged_layout_is_limited_by_memory_only(workload: batching.Workload) -> None:
@@ -428,6 +429,7 @@ def test_the_paged_layout_is_limited_by_memory_only(workload: batching.Workload)
     assert config.num_kv_blocks == 6
     assert config.max_num_seqs == len(workload.prompts)
     assert config.max_model_len == workload.max_len
+    assert not config.enable_prefix_caching
 
 
 @pytest.mark.parametrize(
