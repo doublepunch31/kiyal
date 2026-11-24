@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from benchmarks import batching, capacity, latency, prefix, throughput
+from benchmarks import batching, capacity, latency, prefix, serving, throughput
 from benchmarks.common import REPO_ROOT, capture_environment, median, percentile, save_result
 from benchmarks.latency import build_prompt
 from kiyal.config import EngineConfig
@@ -614,3 +614,84 @@ def test_capacity_main_saves_a_result_file(
     printed = capsys.readouterr().out
     assert "paged" in printed
     assert f"saved {output}" in printed
+
+
+def test_poisson_arrivals_are_seeded_and_scale_with_the_rate() -> None:
+    slow = serving.poisson_arrivals(1000, 1.0, seed=3)
+    fast = serving.poisson_arrivals(1000, 4.0, seed=3)
+    assert slow[0] == 0.0
+    assert slow == sorted(slow)
+    assert slow == serving.poisson_arrivals(1000, 1.0, seed=3)
+    # The same gaps, four times shorter.
+    assert fast == pytest.approx([t / 4 for t in slow])
+    # The mean gap of an exponential distribution is 1 / rate.
+    assert slow[-1] / 999 == pytest.approx(1.0, rel=0.1)
+    with pytest.raises(ValueError, match="rate must be above 0"):
+        serving.poisson_arrivals(10, 0.0, seed=3)
+
+
+def serving_settings(**overrides: object) -> serving.Settings:
+    settings = serving.Settings(
+        model="org/model",
+        revision="abc",
+        device="cpu",
+        dtype="fp32",
+        servers=serving.SERVERS,
+        rates=(1.0,),
+        repeats=1,
+        warmup_requests=2,
+        kv_tokens=8192,
+        batch_size=16,
+        max_num_seqs=64,
+    )
+    return dataclasses.replace(settings, **overrides)
+
+
+def test_continuous_and_paged_servers_get_the_same_kv_memory() -> None:
+    settings = serving_settings()
+    continuous = serving.server_command("continuous", settings, 512, 9000)
+    paged = serving.server_command("paged", settings, 512, 9000)
+    assert continuous[1:2] == paged[1:2] == ["serve"]
+    # 16 rows of 512 tokens against 512 blocks of 16 tokens.
+    assert continuous[-7:] == [
+        *["--block-size", "512", "--num-kv-blocks", "16", "--max-num-seqs", "16"],
+        "--no-prefix-caching",
+    ]
+    assert paged[-7:] == [
+        *["--block-size", "16", "--num-kv-blocks", "512", "--max-num-seqs", "64"],
+        "--no-prefix-caching",
+    ]
+    for command in (continuous, paged):
+        assert command[command.index("--revision") :][:2] == ["--revision", "abc"]
+        assert command[command.index("--max-model-len") :][:2] == ["--max-model-len", "512"]
+
+
+def test_baseline_servers_batch_one_request_or_batch_size_requests() -> None:
+    settings = serving_settings(revision=None)
+    hf = serving.server_command("hf", settings, 512, 9000)
+    static = serving.server_command("static", settings, 512, 9000)
+    assert hf[1:5] == ["-m", "benchmarks.hf_baseline", "--engine", "hf"]
+    assert hf[5:7] == ["--batch-size", "1"]
+    assert static[3:7] == ["--engine", "static", "--batch-size", "16"]
+    assert "--revision" not in hf
+    with pytest.raises(ValueError, match="unknown server 'other'"):
+        serving.server_command("other", settings, 512, 9000)
+
+
+def test_a_serving_run_is_summarized_from_the_chunk_times() -> None:
+    records = [
+        # Sent at 0, chunks at 0.5, 0.6, 0.7: TTFT 0.5, E2E 0.7, TPOT 0.2 / 2.
+        serving.RequestRecord(0.0, [0.5, 0.6, 0.7], prompt_tokens=10, output_tokens=3),
+        # Sent at 1, chunks at 1.2 and 2.0, the second holding 3 tokens.
+        serving.RequestRecord(1.0, [1.2, 2.0], prompt_tokens=20, output_tokens=4),
+    ]
+    summary = serving.summarize(records)
+    assert summary["duration_s"] == 2.0
+    assert summary["requests_per_s"] == 1.0
+    assert summary["output_tokens_per_s"] == 3.5
+    assert summary["total_tokens_per_s"] == 18.5
+    assert summary["ttft_p50_s"] == pytest.approx((0.5 + 0.2) / 2)
+    assert summary["e2e_p99_s"] == pytest.approx(0.7 + 0.99 * (1.0 - 0.7))
+    assert summary["tpot_p50_s"] == pytest.approx((0.1 + 0.8 / 3) / 2)
+    # Gaps 0.1, 0.1 and 0.8.
+    assert summary["itl_p50_s"] == pytest.approx(0.1)

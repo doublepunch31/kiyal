@@ -495,3 +495,87 @@ def test_main_writes_the_capacity_chart_and_table(
         table.read_text() == f"{plot.describe_batching(layouts)}\n\n{plot.capacity_table(layouts)}"
     )
     assert capsys.readouterr().out == f"saved {chart}\nsaved {table}\n"
+
+
+def serving_result(throughput: dict[str, tuple[float, float]]) -> plot.Result:
+    """A serving result in the shape that benchmarks.serving saves. Each server gets its
+    output tokens/s at rates 1 and 4; its other metrics follow from that."""
+
+    def summary(tokens_per_s: float) -> dict[str, float]:
+        return {
+            "output_tokens_per_s": tokens_per_s,
+            "requests_per_s": tokens_per_s / 100,
+            "ttft_p50_s": 10 / tokens_per_s,
+            "ttft_p99_s": 20 / tokens_per_s,
+            "tpot_p50_s": 0.0125,
+            "tpot_p99_s": 0.02,
+            "e2e_p50_s": 1.5,
+            "e2e_p99_s": 3.0,
+        }
+
+    return {
+        "benchmark": "serving",
+        "model": "org/tiny-model",
+        "revision": None,
+        "num_requests": 64,
+        "prompt_tokens": [32, 256],
+        "output_tokens": [16, 256],
+        "rates": [1.0, 4.0],
+        "repeats": 3,
+        "environment": {"device": "cpu", "dtype": "float32", "cpu": "Test CPU", "torch": "2.15.0"},
+        "servers": {
+            server: {
+                "command": ["kiyal", "serve"],
+                "rates": [
+                    {"rate": rate, "runs": [], "median": summary(tokens)}
+                    for rate, tokens in zip((1.0, 4.0), values, strict=True)
+                ],
+            }
+            for server, values in throughput.items()
+        },
+    }
+
+
+@pytest.fixture
+def servers() -> plot.Result:
+    # Listed out of order: the table and the chart follow SERVING_COLORS.
+    return serving_result({"paged": (100.0, 400.0), "hf": (100.0, 125.0)})
+
+
+def test_a_serving_result_is_loaded(tmp_path: Path, servers: plot.Result) -> None:
+    assert plot.load_serving_result(write(tmp_path / "s.json", servers)) == servers
+    with pytest.raises(ValueError, match="not a serving result"):
+        plot.load_serving_result(write(tmp_path / "p.json", prefix_result({})))
+
+
+def test_the_serving_table_lists_every_server_at_every_rate(servers: plot.Result) -> None:
+    lines = plot.serving_table(servers).splitlines()
+    assert lines[0] == (
+        "| rate/s | server | output tokens/s | requests/s | TTFT p50 ms | TTFT p99 ms | "
+        "TPOT p50 ms | TPOT p99 ms | E2E p50 s | E2E p99 s |"
+    )
+    assert lines[2:] == [
+        "| 1 | hf | 100.0 | 1.00 | 100 | 200 | 12.5 | 20.0 | 1.50 | 3.00 |",
+        "| 1 | paged | 100.0 | 1.00 | 100 | 200 | 12.5 | 20.0 | 1.50 | 3.00 |",
+        "| 4 | hf | 125.0 | 1.25 | 80 | 160 | 12.5 | 20.0 | 1.50 | 3.00 |",
+        "| 4 | paged | 400.0 | 4.00 | 25 | 50 | 12.5 | 20.0 | 1.50 | 3.00 |",
+    ]
+
+
+def test_the_serving_description_names_the_workload(servers: plot.Result) -> None:
+    assert plot.describe_serving(servers) == (
+        "tiny-model, cpu float32, Test CPU, 64 requests per rate, Poisson arrivals, "
+        "prompts 32-256, outputs 16-256 tokens, greedy, median of 3 runs"
+    )
+
+
+def test_main_writes_the_serving_chart_and_table(
+    tmp_path: Path, servers: plot.Result, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "serving-cpu"
+    path = write(tmp_path / "s.json", servers)
+    assert plot.main(["serving", str(path), "--output", str(output)]) == 0
+    chart, table = output.with_name("serving-cpu.png"), output.with_name("serving-cpu.md")
+    assert chart.read_bytes().startswith(PNG_SIGNATURE)
+    assert table.read_text() == f"{plot.describe_serving(servers)}\n\n{plot.serving_table(servers)}"
+    assert capsys.readouterr().out == f"saved {chart}\nsaved {table}\n"

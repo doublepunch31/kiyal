@@ -35,12 +35,17 @@ Early development. Implemented so far:
   in the same step share the blocks the first of them computes
 - `kiyal generate`, which streams text decoded with the KV cache. The loop that recomputes the
   whole sequence at every step is kept as the baseline for tests and benchmarks.
+- an OpenAI-compatible HTTP server, `kiyal serve`: `/v1/completions` and `/v1/chat/completions`,
+  streamed as server-sent events or not, `/v1/models`, `/health`, and Prometheus metrics at
+  `/metrics`. The engine steps on a thread of its own, so the batch keeps moving while the
+  server handles HTTP, and a request whose client disconnects is aborted and its KV blocks freed
 
 On SmolLM2-135M-Instruct in fp32 on CPU, the model's logits match `transformers` within 1e-4, and
 greedy generation for a chat prompt gives the same tokens as `transformers`' `generate()`. Decoding
 with the KV cache gives the same tokens as decoding without it, and a static or continuous batch
 gives each prompt the same tokens as decoding it alone, also when the paged cache preempts and
-recomputes requests and when requests share cached prefixes. The server is not implemented yet.
+recomputes requests and when requests share cached prefixes. Requests sent to the server
+together through the official `openai` client get the same text as well.
 
 ## Setup
 
@@ -74,11 +79,48 @@ uv run kiyal generate --model HuggingFaceTB/SmolLM2-135M-Instruct \
 
 `uv run kiyal generate --help` lists the sampling options.
 
+### Serving
+
+```sh
+uv run kiyal serve --model HuggingFaceTB/SmolLM2-135M-Instruct --port 8000
+```
+
+```sh
+curl http://localhost:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+         "messages": [{"role": "user", "content": "What is the capital of France?"}],
+         "max_tokens": 64}'
+```
+
+With the `openai` client (installed with the development dependencies), streaming the reply:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+stream = client.chat.completions.create(
+    model="HuggingFaceTB/SmolLM2-135M-Instruct",
+    messages=[{"role": "user", "content": "What is the capital of France?"}],
+    max_tokens=64,
+    stream=True,
+)
+for chunk in stream:
+    print(chunk.choices[0].delta.content or "", end="", flush=True)
+```
+
+Requests take OpenAI's `max_tokens`, `temperature`, `top_p`, `stop`, `seed`,
+`presence_penalty`, `frequency_penalty`, `stream` and `stream_options`, with `n` = 1 only and no
+`logprobs`, plus the engine's `top_k`, `min_p`, `repetition_penalty` and `ignore_eos` (through
+`extra_body` in the `openai` client). Prompts of `/v1/completions` can be text or token ids.
+Errors come back in OpenAI's format. `uv run kiyal serve --help` lists the batch and KV cache
+options.
+
 ## Benchmarks
 
-All numbers below were measured on a laptop (Apple M4): the KV cache, static batching and prefix
-caching runs on battery power, the continuous batching and paged cache runs on AC power. None
-are NVIDIA GPU numbers.
+All numbers below were measured on a laptop (Apple M4): the KV cache, static batching, prefix
+caching and serving runs on battery power, the continuous batching and paged cache runs on AC
+power. None are NVIDIA GPU numbers.
 
 ### KV cache
 
@@ -282,6 +324,118 @@ On the CPU, where attention is a larger share of a step, the padded first step m
 median no better at 2000 tokens: 16.3 s with the cache, against runs of 13.0, 15.1 and 19.2 s
 without it.
 
+### Serving
+
+The workload of the batching benchmarks again (64 requests, prompts of 32 to 256 random tokens,
+outputs of 16 to 256 tokens, 154 on average, seed 0, greedy, ignoring EOS), now sent over HTTP
+as streamed completions that arrive at random times: a Poisson process at 1 to 16 requests per
+second. The gaps between arrivals come from one seed and are divided by the rate, so every rate
+has the same pattern at a different speed. Four servers, each run as a process of its own
+behind Kiyal's HTTP server, so that only the engine differs:
+
+- transformers' `generate()`, one request at a time: the simplest server around a model
+- static batching of up to 16 requests: a batch runs until its longest output ends, and
+  requests that arrive meanwhile wait for it
+- continuous batching with a KV row per request as long as the longest request (489 tokens),
+  16 rows
+- continuous batching with the paged cache: 512 blocks of 16 tokens (the same 8192 tokens of KV
+  memory), up to 64 requests
+
+Prefix caching is off, since every run sends the same prompts. The client times each request:
+TTFT from sending it to its first token, TPOT as its time after the first token divided by its
+other tokens, E2E to its last token. Throughput counts output tokens from the first request sent
+to the last token received. Median of 3 runs at each rate, after 8 warm-up requests per server.
+
+On the M4 GPU through MPS (fp16):
+
+![Output tokens per second and p99 time to first token of four servers against the request rate on the M4 GPU](benchmarks/results/serving-mps.png)
+
+| rate/s | server | output tokens/s | requests/s | TTFT p50 ms | TTFT p99 ms | TPOT p50 ms | TPOT p99 ms | E2E p50 s | E2E p99 s |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | hf | 133.2 | 0.87 | 247 | 1709 | 4.9 | 6.0 | 1.20 | 2.35 |
+| 1 | static | 132.6 | 0.86 | 842 | 2196 | 12.1 | 12.7 | 2.47 | 4.55 |
+| 1 | continuous | 132.3 | 0.86 | 45 | 112 | 15.3 | 16.8 | 2.50 | 3.88 |
+| 1 | paged | 132.4 | 0.86 | 43 | 91 | 15.7 | 17.7 | 2.64 | 3.95 |
+| 2 | hf | 190.7 | 1.24 | 6078 | 15833 | 5.0 | 6.2 | 7.18 | 16.38 |
+| 2 | static | 253.7 | 1.65 | 1879 | 3471 | 13.2 | 13.8 | 4.09 | 6.37 |
+| 2 | continuous | 261.6 | 1.70 | 43 | 80 | 17.0 | 18.0 | 2.77 | 4.34 |
+| 2 | paged | 261.5 | 1.70 | 44 | 76 | 18.1 | 19.7 | 2.92 | 4.60 |
+| 4 | hf | 173.0 | 1.12 | 17677 | 38446 | 5.4 | 6.9 | 19.12 | 38.88 |
+| 4 | static | 386.0 | 2.51 | 2809 | 6947 | 18.3 | 19.8 | 5.68 | 10.52 |
+| 4 | continuous | 489.6 | 3.18 | 48 | 329 | 20.7 | 24.0 | 3.33 | 5.83 |
+| 4 | paged | 473.3 | 3.07 | 48 | 76 | 23.9 | 30.0 | 3.82 | 6.90 |
+| 8 | hf | 175.6 | 1.14 | 22741 | 46601 | 5.4 | 6.2 | 23.92 | 46.93 |
+| 8 | static | 422.4 | 2.74 | 5152 | 12816 | 19.1 | 19.4 | 8.35 | 14.52 |
+| 8 | continuous | 589.5 | 3.83 | 1421 | 5373 | 24.3 | 26.6 | 5.61 | 9.37 |
+| 8 | paged | 653.2 | 4.24 | 55 | 1213 | 35.3 | 46.4 | 6.01 | 9.28 |
+| 16 | hf | 174.4 | 1.13 | 24722 | 51464 | 5.4 | 6.8 | 25.88 | 51.79 |
+| 16 | static | 455.3 | 2.96 | 5641 | 14033 | 19.1 | 19.4 | 9.71 | 17.53 |
+| 16 | continuous | 608.7 | 3.95 | 3436 | 9680 | 24.6 | 29.9 | 7.78 | 12.50 |
+| 16 | paged | 676.4 | 4.39 | 61 | 5247 | 41.0 | 57.2 | 7.91 | 10.99 |
+
+Until a server saturates, the request rate sets its throughput: at 1 request per second all four
+deliver 132 tokens/s. Past that point the throughput stays flat at what the server can do, and
+the rest shows up as waiting. transformers, one request at a time, levels off at about 175
+tokens/s from 2 requests per second, and its p99 TTFT grows to 51 s. At 16 requests per second
+static batching gives 455 tokens/s, continuous batching with KV rows 609 (1.34 times static), and
+with the paged cache 676 (1.11 times KV rows, 3.9 times transformers).
+
+The time to the first token separates the servers before throughput does. Under static batching
+a request that arrives during a batch waits for all of it, so its median TTFT is 842 ms already at
+1 request per second. Continuous batching starts a request at the next step if it has a seat: the
+p99 TTFT stays under 330 ms up to 4 requests per second. At 8, the 16 KV rows are full and the p99
+is 5.4 s, while the paged cache, which seats requests by the blocks they use, keeps it at 1.2 s.
+Larger batches cost time per token: at 8 requests per second the paged server's median TPOT is
+35 ms, against 24 ms with KV rows.
+
+At low load transformers is faster for a single request: 4.9 ms per output token against 15 to
+16 ms for Kiyal's continuous servers at 1 request per second, and a median request takes 1.2 s
+against 2.5 s. Part of the gap is batching: at that rate about 2.5 requests are in flight on
+average (1 per second, about 2.5 s each), and each new arrival's prefill pauses the others. The
+rest is Kiyal's own step, 9.0 ms for a batch of one on MPS (static batching, above). Why it costs
+more than transformers' at small batches on MPS has not been profiled yet. On the CPU the order
+is reversed: 15 ms per token for transformers, 10.5 ms for Kiyal at batch 1.
+
+On the CPU (fp32, 4 threads):
+
+| rate/s | server | output tokens/s | requests/s | TTFT p50 ms | TTFT p99 ms | TPOT p50 ms | TPOT p99 ms | E2E p50 s | E2E p99 s |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | hf | 63.2 | 0.41 | 35523 | 83132 | 15.3 | 19.0 | 38.73 | 84.44 |
+| 1 | static | 111.5 | 0.72 | 6720 | 14745 | 51.8 | 53.9 | 15.02 | 25.98 |
+| 1 | continuous | 132.1 | 0.86 | 96 | 203 | 42.3 | 47.5 | 6.92 | 10.88 |
+| 1 | paged | 130.5 | 0.85 | 100 | 204 | 50.0 | 58.5 | 8.00 | 13.29 |
+| 2 | hf | 63.1 | 0.41 | 56325 | 118618 | 15.2 | 20.9 | 59.86 | 119.64 |
+| 2 | static | 147.3 | 0.96 | 11395 | 25382 | 49.8 | 52.1 | 19.92 | 33.19 |
+| 2 | continuous | 238.2 | 1.55 | 117 | 1609 | 48.5 | 54.6 | 8.17 | 13.09 |
+| 2 | paged | 222.7 | 1.45 | 112 | 241 | 66.3 | 78.0 | 10.60 | 17.83 |
+| 4 | hf | 66.7 | 0.43 | 61561 | 128279 | 14.5 | 17.2 | 64.80 | 129.22 |
+| 4 | static | 151.7 | 0.99 | 19767 | 40311 | 50.0 | 51.7 | 28.79 | 48.86 |
+| 4 | continuous | 294.0 | 1.91 | 3219 | 10492 | 48.1 | 60.2 | 11.41 | 18.92 |
+| 4 | paged | 246.9 | 1.60 | 138 | 8409 | 103.4 | 163.2 | 19.51 | 26.80 |
+| 8 | hf | 64.6 | 0.42 | 68813 | 141846 | 15.0 | 18.2 | 72.13 | 142.82 |
+| 8 | static | 153.7 | 1.00 | 24140 | 48512 | 50.0 | 53.2 | 31.31 | 53.50 |
+| 8 | continuous | 302.8 | 1.97 | 6756 | 18742 | 47.9 | 66.7 | 15.36 | 25.18 |
+| 8 | paged | 264.0 | 1.72 | 164 | 15522 | 107.3 | 271.8 | 21.24 | 30.32 |
+| 16 | hf | 63.2 | 0.41 | 73306 | 149735 | 15.2 | 17.7 | 76.67 | 150.64 |
+| 16 | static | 175.4 | 1.14 | 14790 | 40592 | 50.8 | 56.0 | 27.06 | 51.37 |
+| 16 | continuous | 307.0 | 1.99 | 8613 | 22677 | 47.5 | 61.2 | 17.41 | 28.39 |
+| 16 | paged | 274.6 | 1.78 | 235 | 19050 | 111.7 | 437.6 | 22.90 | 32.17 |
+
+On the CPU every server saturates sooner: transformers (63 tokens/s) and static batching fall
+behind already at 1 request per second, and continuous batching levels off at about 300
+tokens/s from 4. Here the paged cache gives less throughput than KV rows (275 against 307 tokens/s
+at 16 requests per second), with a median TPOT twice as long (107 against 48 ms at 8), though its
+TTFT stays lower at 2 requests per second (p99 241 ms against 1.6 s). In the same session the
+capacity benchmark at 8192 tokens, with all 64 requests at once and no server, gave the two
+layouts the same throughput (303 and 298 tokens/s), so the difference comes with serving. Its
+cause is not measured; one candidate is that the paged server streams to more clients at once,
+and the HTTP work of the server and of the benchmark client competes with the model for the same
+CPU cores. That capacity run also shows how much CPU throughput moves between sessions: its own
+session gave 179 and 154 tokens/s (table above).
+
+Throughput varied by at most 4% between the runs of a Kiyal server. The p99 TTFT, close to the
+slowest of 64 requests, varied by up to 41%, but each comparison above holds in every run.
+
 The result files, the CPU charts and the full tables are in
 [benchmarks/results/](benchmarks/results/).
 
@@ -311,6 +465,12 @@ preempted and recomputed in every arrival order. Prefix caching is the fifth: re
 prompts share their first tokens in several ways, including a prompt that is a whole number of
 blocks and two equal prompts, must again match their prompts decoded alone, at block sizes 1, 4
 and 16, and with a pool small enough that requests are preempted and cached blocks evicted.
+
+The server is tested through HTTP with the `openai` client and the tiny model: errors, streaming,
+chat templates, metrics, and clients that disconnect mid-stream, before their first token, or
+before a non-streamed response, each of which must abort its request and free its KV blocks.
+Requests sent together, half of them streamed, must get the text of their prompts decoded
+alone; a slow variant does the same with SmolLM2.
 
 ```sh
 # Single-request decoding speed at several output lengths, saved as JSON in benchmarks/raw/.
@@ -342,6 +502,16 @@ uv run python -m benchmarks.plot capacity benchmarks/results/capacity-cpu.json \
 uv run python -m benchmarks.prefix --model HuggingFaceTB/SmolLM2-135M-Instruct --device cpu
 uv run python -m benchmarks.plot prefix benchmarks/results/prefix-cpu.json \
     --output benchmarks/results/prefix-cpu
+
+# Four servers under Poisson arrivals at 1 to 16 requests per second, then the chart and table.
+# Takes 40 to 80 minutes per device on the laptop above.
+uv run python -m benchmarks.serving --model HuggingFaceTB/SmolLM2-135M-Instruct --device cpu
+uv run python -m benchmarks.plot serving benchmarks/results/serving-cpu.json \
+    --output benchmarks/results/serving-cpu
+
+# The serving benchmark's baselines as OpenAI-compatible servers of their own: transformers'
+# generate() one request at a time, or Kiyal's static batching with --engine static.
+uv run python -m benchmarks.hf_baseline --model HuggingFaceTB/SmolLM2-135M-Instruct --port 8001
 ```
 
 ## License

@@ -11,6 +11,8 @@ batching or capacity result:
         --output benchmarks/results/batching-cpu
     uv run python -m benchmarks.plot capacity benchmarks/results/capacity-cpu.json \
         --output benchmarks/results/capacity-cpu
+    uv run python -m benchmarks.plot serving benchmarks/results/serving-cpu.json \
+        --output benchmarks/results/serving-cpu
 """
 
 import argparse
@@ -23,7 +25,7 @@ from typing import Any
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
-from matplotlib.ticker import FuncFormatter, NullLocator
+from matplotlib.ticker import FuncFormatter, LogLocator, NullLocator
 
 # Engines in the order they are drawn and listed. Each keeps its color in every chart.
 ENGINE_COLORS = {"cached": "#2a78d6", "naive": "#eb6834"}
@@ -41,6 +43,20 @@ CAPACITY_LABELS = {"contiguous": "contiguous", "paged": "paged"}
 # the palette, magenta.
 PREFIX_COLORS = {"off": CAPACITY_COLORS["paged"], "on": "#e87ba4"}
 PREFIX_LABELS = {"off": "without prefix caching", "on": "with prefix caching"}
+# Each server keeps the color of its engine in the earlier charts; transformers' generate()
+# is new and takes the next free slot of the palette, green.
+SERVING_COLORS = {
+    "hf": "#008300",
+    "static": STATIC_COLOR,
+    "continuous": BATCHING_COLORS["continuous"],
+    "paged": CAPACITY_COLORS["paged"],
+}
+SERVING_LABELS = {
+    "hf": "transformers generate(), one at a time",
+    "static": "static batching",
+    "continuous": "continuous batching, KV rows",
+    "paged": "continuous batching, paged KV",
+}
 SURFACE = "#fcfcfb"
 TEXT = "#0b0b0b"
 MUTED_TEXT = "#52514e"
@@ -671,13 +687,143 @@ def plot_prefix(result: Result, path: Path) -> Path:
     return path
 
 
+def load_serving_result(path: Path) -> Result:
+    """Reads a serving result file.
+
+    Raises:
+        ValueError: If the file is not a serving result.
+    """
+    result = json.loads(path.read_text())
+    if result.get("benchmark") != "serving":
+        raise ValueError(f"{path} is not a serving result")
+    return result
+
+
+def serving_servers(result: Result) -> list[str]:
+    """The servers of a serving result, in the order of SERVING_COLORS."""
+    return [server for server in SERVING_COLORS if server in result["servers"]]
+
+
+def serving_medians(result: Result, server: str, metric: str) -> dict[float, float]:
+    """Returns the median of a metric for each request rate of one server."""
+    return {entry["rate"]: entry["median"][metric] for entry in result["servers"][server]["rates"]}
+
+
+def describe_serving(result: Result) -> str:
+    """Returns one line naming the model, the machine and the workload of a serving run."""
+    environment = result["environment"]
+    model = str(result["model"]).rsplit("/", 1)[-1]
+    hardware = environment.get("gpu") or environment["cpu"]
+    repeats = result["repeats"]
+    runs = "1 run" if repeats == 1 else f"median of {repeats} runs"
+    prompt_min, prompt_max = result["prompt_tokens"]
+    output_min, output_max = result["output_tokens"]
+    return (
+        f"{model}, {environment['device']} {environment['dtype']}, {hardware}, "
+        f"{result['num_requests']} requests per rate, Poisson arrivals, prompts "
+        f"{prompt_min}-{prompt_max}, outputs {output_min}-{output_max} tokens, greedy, {runs}"
+    )
+
+
+def serving_table(result: Result) -> str:
+    """Renders a serving result as a markdown table with one row per request rate and
+    server. TTFT and TPOT are in milliseconds, E2E in seconds."""
+    header = [
+        "rate/s",
+        "server",
+        "output tokens/s",
+        "requests/s",
+        "TTFT p50 ms",
+        "TTFT p99 ms",
+        "TPOT p50 ms",
+        "TPOT p99 ms",
+        "E2E p50 s",
+        "E2E p99 s",
+    ]
+    lines = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
+    for rate in result["rates"]:
+        for server in serving_servers(result):
+            entry = next(e for e in result["servers"][server]["rates"] if e["rate"] == rate)
+            summary = entry["median"]
+            row = [
+                f"{rate:g}",
+                server,
+                f"{summary['output_tokens_per_s']:.1f}",
+                f"{summary['requests_per_s']:.2f}",
+                f"{summary['ttft_p50_s'] * 1000:.0f}",
+                f"{summary['ttft_p99_s'] * 1000:.0f}",
+                f"{summary['tpot_p50_s'] * 1000:.1f}",
+                f"{summary['tpot_p99_s'] * 1000:.1f}",
+                f"{summary['e2e_p50_s']:.2f}",
+                f"{summary['e2e_p99_s']:.2f}",
+            ]
+            lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def plot_serving(result: Result, path: Path) -> Path:
+    """Draws throughput and p99 time to first token against the request rate, one line
+    per server."""
+    figure = Figure(figsize=(10.5, 4.8), dpi=160, facecolor=SURFACE)
+    throughput_axes, ttft_axes = figure.subplots(1, 2)
+    rates = sorted(result["rates"])
+    throughput_labels: list[tuple[float, float, str]] = []
+    ttft_labels: list[tuple[float, float, str]] = []
+    for server in serving_servers(result):
+        color = SERVING_COLORS[server]
+        label = SERVING_LABELS[server]
+        throughput = serving_medians(result, server, "output_tokens_per_s")
+        ttft = serving_medians(result, server, "ttft_p99_s")
+        _draw_series(throughput_axes, throughput, color, label, None)
+        _draw_series(ttft_axes, ttft, color, label, None)
+        last = rates[-1]
+        throughput_labels.append((last, throughput[last], f"{throughput[last]:,.0f}"))
+        ttft_labels.append((last, ttft[last], _seconds(ttft[last])))
+
+    xlabel = "request rate, requests per second"
+    _style_axes(throughput_axes, rates, "Output tokens per second", xlabel)
+    throughput_axes.set_ylim(bottom=0)
+    _style_axes(ttft_axes, rates, "p99 time to first token, log scale", xlabel)
+    # Waiting time grows by orders of magnitude once a server saturates.
+    ttft_axes.set_yscale("log")
+    ttft_axes.yaxis.set_major_locator(LogLocator(base=10, subs=(1.0, 2.0, 5.0)))
+    ttft_axes.yaxis.set_major_formatter(FuncFormatter(lambda value, _: _seconds(value)))
+    ttft_axes.yaxis.set_minor_locator(NullLocator())
+    _spread_end_labels(throughput_axes, throughput_labels)
+    _spread_end_labels(ttft_axes, ttft_labels)
+    # One legend for both panels, in a row above them, clear of the lines.
+    handles, labels = throughput_axes.get_legend_handles_labels()
+    figure.legend(
+        handles, labels, frameon=False, labelcolor=TEXT, fontsize=8.5,
+        loc="upper left", bbox_to_anchor=(0.055, 0.86), ncol=len(labels),
+    )  # fmt: skip
+
+    figure.suptitle(
+        "Serving requests that arrive at random times",
+        x=0.06, y=0.97, ha="left", color=TEXT, fontsize=13, fontweight="bold",
+    )  # fmt: skip
+    figure.text(0.06, 0.885, describe_serving(result), color=MUTED_TEXT, fontsize=9)
+    figure.subplots_adjust(left=0.07, right=0.97, top=0.70, bottom=0.12, wspace=0.2)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path)
+    return path
+
+
+def _seconds(value: float) -> str:
+    return f"{value * 1000:.0f} ms" if value < 1 else f"{value:.3g} s"
+
+
 def _draw_series(
-    axes: Axes, values: dict[int, float], color: str, label: str, end_label: str | None
+    axes: Axes,
+    values: dict[int, float] | dict[float, float],
+    color: str,
+    label: str,
+    end_label: str | None,
 ) -> Line2D:
-    lengths = sorted(values)
+    points = sorted(values.items())
     (line,) = axes.plot(
-        lengths,
-        [values[length] for length in lengths],
+        [x for x, _ in points],
+        [y for _, y in points],
         color=color,
         label=label,
         linewidth=2,
@@ -695,7 +841,7 @@ def _draw_series(
         return line
     axes.annotate(
         end_label,
-        (lengths[-1], values[lengths[-1]]),
+        points[-1],
         xytext=(8, 0),
         textcoords="offset points",
         color=TEXT,
@@ -705,7 +851,9 @@ def _draw_series(
     return line
 
 
-def _spread_end_labels(axes: Axes, labels: list[tuple[int, float, str]]) -> None:
+def _spread_end_labels(
+    axes: Axes, labels: list[tuple[int, float, str]] | list[tuple[float, float, str]]
+) -> None:
     """Writes labels next to the ends of lines, moved apart vertically where they would
     overlap. Call it after the axis limits are final."""
     min_gap = 12.0  # points, a little more than the 9-point text
@@ -731,13 +879,13 @@ def _spread_end_labels(axes: Axes, labels: list[tuple[int, float, str]]) -> None
         )
 
 
-def _style_axes(axes: Axes, lengths: Sequence[int], title: str, xlabel: str) -> None:
+def _style_axes(axes: Axes, lengths: Sequence[float], title: str, xlabel: str) -> None:
     axes.set_facecolor(SURFACE)
     axes.set_title(title, loc="left", color=TEXT, fontsize=10, pad=24)
     axes.set_xlabel(xlabel, color=MUTED_TEXT, fontsize=9)
     # Values double from point to point, so a log scale spaces them evenly.
     axes.set_xscale("log", base=2)
-    axes.set_xticks(list(lengths), [str(length) for length in lengths])
+    axes.set_xticks(list(lengths), [f"{length:g}" for length in lengths])
     axes.xaxis.set_minor_locator(NullLocator())
     # Room on the right for the labels at the ends of the lines.
     axes.set_xlim(lengths[0] / 1.25, lengths[-1] * 2.1)
@@ -781,6 +929,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     prefix.add_argument(
         "--output", type=Path, required=True, help="path of the chart and table, without suffix"
     )
+    serving = commands.add_parser("serving", help="servers under Poisson arrivals")
+    serving.add_argument("result", type=Path, help="serving result file")
+    serving.add_argument(
+        "--output", type=Path, required=True, help="path of the chart and table, without suffix"
+    )
     args = parser.parse_args(argv)
 
     chart = args.output.with_name(args.output.name + ".png")
@@ -801,10 +954,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = load_capacity_result(args.result)
         plot_capacity(result, chart)
         table.write_text(f"{describe_batching(result)}\n\n{capacity_table(result)}")
-    else:
+    elif args.command == "prefix":
         result = load_prefix_result(args.result)
         plot_prefix(result, chart)
         table.write_text(f"{describe_prefix(result)}\n\n{prefix_table(result)}")
+    else:
+        result = load_serving_result(args.result)
+        plot_serving(result, chart)
+        table.write_text(f"{describe_serving(result)}\n\n{serving_table(result)}")
     print(f"saved {chart}")
     print(f"saved {table}")
     return 0
