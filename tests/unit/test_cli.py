@@ -1,5 +1,6 @@
 import shutil
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -7,11 +8,14 @@ import torch
 import uvicorn
 from fastapi import FastAPI
 
-from kiyal import __version__
+from kiyal import __version__, cli
 from kiyal.cli import main
 from kiyal.engine.generator import TextGenerator
 from kiyal.engine.sequence import SamplingParams
-from kiyal.model.loader import load_model
+from kiyal.model import loader
+from kiyal.model.llama import LlamaModel
+from kiyal.model.loader import Quantization, load_model
+from kiyal.quant.int8 import QuantLinear
 from kiyal.tokenizer import Tokenizer
 from tests.server.serving import serving
 
@@ -46,9 +50,16 @@ def run_generate(model_dir: Path, *args: str) -> list[str]:
     return ["generate", "--model", str(model_dir), "--device", "cpu", "--dtype", "fp32", *args]
 
 
-def expected_text(model_dir: Path, prompt_token_ids: list[int], params: SamplingParams) -> str:
+def expected_text(
+    model_dir: Path,
+    prompt_token_ids: list[int],
+    params: SamplingParams,
+    quantization: Quantization | None = None,
+) -> str:
     """What the engine generates for a prompt, bypassing the command line."""
-    model = load_model(model_dir, device=torch.device("cpu"), dtype=torch.float32)
+    model = load_model(
+        model_dir, device=torch.device("cpu"), dtype=torch.float32, quantization=quantization
+    )
     generator = TextGenerator(model, Tokenizer.from_dir(model_dir))
     return "".join(step.text for step in generator.generate(prompt_token_ids, params))
 
@@ -118,6 +129,19 @@ def test_generate_passes_sampling_options_to_the_engine(
     captured = capsys.readouterr()
     assert captured.out == full_text[: full_text.index(stop)] + "\n"
     assert "finish reason: stop" in captured.err
+
+
+def test_generate_with_int8_weights_prints_what_the_int8_model_generates(
+    tiny_model_dir: Path, tiny_tokenizer: Tokenizer, capsys: pytest.CaptureFixture[str]
+) -> None:
+    options = ("--raw", "--max-tokens", "24", "--temperature", "0", "the cat")
+    assert main(run_generate(tiny_model_dir, "--quantization", "int8", *options)) == 0
+    params = SamplingParams(max_tokens=24, temperature=0)
+    prompt = tiny_tokenizer.encode("the cat")
+    int8_text = expected_text(tiny_model_dir, prompt, params, "int8")
+    # Otherwise the test could not tell whether the option reached the loader.
+    assert int8_text != expected_text(tiny_model_dir, prompt, params)
+    assert capsys.readouterr().out == int8_text + "\n"
 
 
 def test_generate_without_a_chat_template_continues_the_plain_text(
@@ -209,6 +233,43 @@ def test_serve_names_the_model_by_its_path_by_default(
     monkeypatch.setattr(uvicorn, "run", run)
     assert main(["serve", "--model", str(tiny_model_dir), "--device", "cpu"]) == 0
     assert served == [str(tiny_model_dir)]
+
+
+def test_serve_loads_int8_weights(
+    tiny_model_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    quantized: list[bool] = []
+
+    def run(app: FastAPI, **kwargs: object) -> None:
+        with serving(app) as base_url:
+            response = httpx.post(
+                f"{base_url}/v1/completions",
+                json={"model": str(tiny_model_dir), "prompt": "the cat", "max_tokens": 4},
+            )
+            assert response.status_code == 200
+
+    real_load_model = loader.load_model
+
+    def load_and_check(*args: Any, **kwargs: Any) -> LlamaModel:
+        model = real_load_model(*args, **kwargs)
+        quantized.append(isinstance(model.get_submodule("layers.0.attn.q_proj"), QuantLinear))
+        return model
+
+    monkeypatch.setattr(uvicorn, "run", run)
+    monkeypatch.setattr(cli, "load_model", load_and_check)
+    args = ["serve", "--model", str(tiny_model_dir), "--device", "cpu", "--quantization", "int8"]
+    assert main(args) == 0
+    assert quantized == [True]
+    assert "in float32, int8 weights" in capsys.readouterr().err
+
+
+def test_unknown_quantization_is_a_usage_error(
+    tiny_model_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        main(["generate", "--model", str(tiny_model_dir), "--quantization", "int4", "the cat"])
+    assert exc_info.value.code == 2
+    assert "invalid choice: 'int4'" in capsys.readouterr().err
 
 
 def test_serve_reports_invalid_engine_settings(

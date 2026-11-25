@@ -12,7 +12,7 @@ from kiyal.engine.async_engine import AsyncEngine
 from kiyal.engine.generator import TextGenerator
 from kiyal.engine.llm_engine import LLMEngine
 from kiyal.engine.sequence import SamplingParams
-from kiyal.model.loader import CheckpointError, load_model, resolve_model_dir
+from kiyal.model.loader import QUANTIZATIONS, CheckpointError, load_model, resolve_model_dir
 from kiyal.server.app import build_app
 from kiyal.tokenizer import Tokenizer, TokenizerError
 
@@ -135,6 +135,12 @@ def _add_model_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--revision", help="branch, tag or commit of a Hugging Face repo")
     parser.add_argument("--device", default="auto", help="auto, cuda, cuda:N, mps or cpu")
     parser.add_argument("--dtype", default="auto", help="auto, fp32, fp16 or bf16")
+    parser.add_argument(
+        "--quantization",
+        choices=QUANTIZATIONS,
+        help="int8 stores the attention and MLP weights in 8 bits with a scale per output "
+        "channel: less memory, but not faster",
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -175,7 +181,7 @@ def _run_generate(args: argparse.Namespace) -> int:
     dtype = resolve_dtype(args.dtype, device)
     model_dir = resolve_model_dir(args.model, revision=args.revision)
     tokenizer = Tokenizer.from_dir(model_dir)
-    model = load_model(model_dir, device=device, dtype=dtype)
+    model = load_model(model_dir, device=device, dtype=dtype, quantization=args.quantization)
     prompt_token_ids = _encode_prompt(tokenizer, args.prompt, system=args.system, raw=args.raw)
     generator = TextGenerator(model, tokenizer)
 
@@ -217,12 +223,13 @@ def _run_serve(args: argparse.Namespace) -> int:
     device = resolve_device(args.device)
     dtype = resolve_dtype(args.dtype, device)
     model_dir = resolve_model_dir(args.model, revision=args.revision)
-    model = load_model(model_dir, device=device, dtype=dtype)
+    model = load_model(model_dir, device=device, dtype=dtype, quantization=args.quantization)
     engine = LLMEngine(model, Tokenizer.from_dir(model_dir), config)
+    weights = "" if args.quantization is None else f", {args.quantization} weights"
     print(
         f"kiyal: {engine.num_kv_blocks} KV blocks of {config.block_size} tokens, "
         f"up to {engine.max_model_len} tokens per request, on {device} in "
-        f"{str(dtype).removeprefix('torch.')}",
+        f"{str(dtype).removeprefix('torch.')}{weights}",
         file=sys.stderr,
     )
     # A second tokenizer for the server, which encodes prompts on another thread than the
