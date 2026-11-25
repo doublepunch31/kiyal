@@ -901,39 +901,30 @@ def _format(value: float | None, spec: str) -> str:
     return "-" if value is None else format(value, spec)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Renders benchmark results.")
     commands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
     latency = commands.add_parser("latency", help="decoding speed against output length")
     latency.add_argument("results", type=Path, nargs="+", help="latency result files")
-    latency.add_argument(
-        "--output", type=Path, required=True, help="path of the chart and table, without suffix"
-    )
     throughput = commands.add_parser("throughput", help="static batching across batch sizes")
     throughput.add_argument("result", type=Path, help="throughput result file")
-    throughput.add_argument(
-        "--output", type=Path, required=True, help="path of the chart and table, without suffix"
-    )
     batching = commands.add_parser("batching", help="static against continuous batching")
     batching.add_argument("result", type=Path, help="batching result file")
-    batching.add_argument(
-        "--output", type=Path, required=True, help="path of the chart and table, without suffix"
-    )
     capacity = commands.add_parser("capacity", help="contiguous against paged KV memory")
     capacity.add_argument("result", type=Path, help="capacity result file")
-    capacity.add_argument(
-        "--output", type=Path, required=True, help="path of the chart and table, without suffix"
-    )
     prefix = commands.add_parser("prefix", help="time to first token with prefix caching")
     prefix.add_argument("result", type=Path, help="prefix caching result file")
-    prefix.add_argument(
-        "--output", type=Path, required=True, help="path of the chart and table, without suffix"
-    )
     serving = commands.add_parser("serving", help="servers under Poisson arrivals")
     serving.add_argument("result", type=Path, help="serving result file")
-    serving.add_argument(
-        "--output", type=Path, required=True, help="path of the chart and table, without suffix"
-    )
+    for command in commands.choices.values():
+        command.add_argument(
+            "--output", type=Path, required=True, help="path of the chart and table, without suffix"
+        )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
 
     chart = args.output.with_name(args.output.name + ".png")
