@@ -1,0 +1,47 @@
+{
+  "benchmark": "perplexity",
+  "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+  "revision": "12fd25f",
+  "dataset": {
+    "repo": "Salesforce/wikitext",
+    "config": "wikitext-2-raw-v1",
+    "split": "test",
+    "revision": "b08601e04326c79dfdd32d625aee71d232d685c3",
+    "tokens": 304986
+  },
+  "window": 1024,
+  "stride": 512,
+  "tokens": 304986,
+  "scored_tokens": 304985,
+  "environment": {
+    "timestamp": "2026-11-25T14:08:05+00:00",
+    "kiyal_version": "0.1.0.dev0",
+    "kiyal_commit": "0c55d7e54b70a3fb52b240eae542ba528e84f158",
+    "kiyal_uncommitted_changes": true,
+    "python": "3.12.12",
+    "platform": "macOS-15.7.4-arm64-arm-64bit",
+    "cpu": "Apple M4",
+    "cpu_threads": 4,
+    "power_source": "AC Power",
+    "torch": "2.15.0",
+    "device": "cpu",
+    "dtype": "float32"
+  },
+  "results": {
+    "reference": "float32",
+    "models": {
+      "float32": {
+        "perplexity": 16.59449589676643,
+        "mean_nll": 2.8090710678962374,
+        "forward_s": 304.947723119054
+      },
+      "int8": {
+        "perplexity": 16.62217794846724,
+        "mean_nll": 2.81073782467257,
+        "forward_s": 332.25718049379066
+      }
+    },
+    "perplexity_increase": 0.001668146587460173,
+    "top1_agreement": 0.971500237716609
+  }
+}

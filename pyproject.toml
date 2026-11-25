@@ -73,6 +73,7 @@ venv = ".venv"
 
 [dependency-groups]
 dev = [
+    "datasets>=5.2.0",
     "httpx>=0.28.1",
     "matplotlib>=3.11.2",
     "openai>=3.58.0",

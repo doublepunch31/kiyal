@@ -1,5 +1,6 @@
 import dataclasses
 import json
+import math
 import subprocess
 from functools import partial
 from pathlib import Path
@@ -7,7 +8,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from benchmarks import batching, capacity, latency, prefix, serving, throughput
+from benchmarks import batching, capacity, latency, perplexity, prefix, serving, throughput
 from benchmarks.common import REPO_ROOT, capture_environment, median, percentile, save_result
 from benchmarks.latency import build_prompt
 from kiyal.config import EngineConfig
@@ -695,3 +696,114 @@ def test_a_serving_run_is_summarized_from_the_chunk_times() -> None:
     assert summary["tpot_p50_s"] == pytest.approx((0.1 + 0.8 / 3) / 2)
     # Gaps 0.1, 0.1 and 0.8.
     assert summary["itl_p50_s"] == pytest.approx(0.1)
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "window", "stride"),
+    [(10, 4, 2), (9, 4, 2), (40, 16, 8), (40, 16, 16), (40, 16, 1), (5, 16, 8), (2, 4, 4)],
+)
+def test_sliding_windows_score_every_token_but_the_first_once(
+    num_tokens: int, window: int, stride: int
+) -> None:
+    windows = perplexity.sliding_windows(num_tokens, window, stride)
+    scored = [t for w in windows for t in range(w.end - w.num_scored, w.end)]
+    assert scored == list(range(1, num_tokens))
+    for index, w in enumerate(windows):
+        assert w.start == index * stride
+        assert w.end - w.start <= window
+        assert w.num_scored >= 1
+        if index > 0:
+            # Every scored token sees at least window - stride tokens of its window first.
+            assert w.end - w.num_scored - w.start >= window - stride
+
+
+def test_sliding_windows_reject_bad_settings() -> None:
+    with pytest.raises(ValueError, match="at least 2 tokens"):
+        perplexity.sliding_windows(1, 4, 2)
+    with pytest.raises(ValueError, match=r"stride must be in \[1, window=4\]"):
+        perplexity.sliding_windows(10, 4, 5)
+    with pytest.raises(ValueError, match="stride must be"):
+        perplexity.sliding_windows(10, 4, 0)
+
+
+def score_token_by_token(
+    model: LlamaModel, token_ids: list[int], windows: list[perplexity.Window]
+) -> tuple[float, list[int]]:
+    """Each scored token's NLL and the model's top token, from one forward per token."""
+    nll_sum = 0.0
+    top: list[int] = []
+    with torch.inference_mode():
+        for w in windows:
+            for target in range(w.end - w.num_scored, w.end):
+                context = torch.tensor([token_ids[w.start : target]])
+                logits = model(context, torch.arange(context.shape[1]).unsqueeze(0))[0]
+                nll_sum -= float(torch.log_softmax(logits, dim=-1)[token_ids[target]])
+                top.append(int(logits.argmax()))
+    return nll_sum, top
+
+
+def test_compare_scores_each_token_given_its_window(tiny_model_dir: Path) -> None:
+    reference = load_model(tiny_model_dir, device=CPU, dtype=torch.float32)
+    candidate = load_model(tiny_model_dir, device=CPU, dtype=torch.float32, quantization="int8")
+    generator = torch.Generator().manual_seed(0)
+    token_ids = torch.randint(0, reference.config.vocab_size, (40,), generator=generator).tolist()
+    windows = perplexity.sliding_windows(len(token_ids), 16, 8)
+    comparison = perplexity.compare(reference, candidate, token_ids, windows)
+
+    reference_nll, reference_top = score_token_by_token(reference, token_ids, windows)
+    candidate_nll, candidate_top = score_token_by_token(candidate, token_ids, windows)
+    assert comparison.num_scored == 39
+    assert comparison.reference.nll_sum == pytest.approx(reference_nll, rel=1e-5)
+    assert comparison.candidate.nll_sum == pytest.approx(candidate_nll, rel=1e-5)
+    assert comparison.reference_perplexity == pytest.approx(math.exp(reference_nll / 39))
+    agreed = sum(a == b for a, b in zip(reference_top, candidate_top, strict=True))
+    assert comparison.num_agreed == agreed
+    assert comparison.agreement == agreed / 39
+    assert comparison.perplexity_increase == pytest.approx(
+        comparison.candidate_perplexity / comparison.reference_perplexity - 1
+    )
+
+
+def test_a_model_compared_with_itself_agrees_everywhere(tiny_model_dir: Path) -> None:
+    model = load_model(tiny_model_dir, device=CPU, dtype=torch.float32)
+    token_ids = list(range(3, 43))
+    comparison = perplexity.compare(
+        model, model, token_ids, perplexity.sliding_windows(len(token_ids), 16, 8)
+    )
+    assert comparison.agreement == 1.0
+    assert comparison.perplexity_increase == 0.0
+
+
+def test_compare_rejects_windows_longer_than_the_context(tiny_model_dir: Path) -> None:
+    model = load_model(tiny_model_dir, device=CPU, dtype=torch.float32)
+    windows = perplexity.sliding_windows(300, 200, 100)
+    with pytest.raises(ValueError, match="window of 200 tokens exceeds the model's context of 128"):
+        perplexity.compare(model, model, list(range(300)), windows)
+
+
+def test_perplexity_main_saves_a_result_file(
+    tiny_model_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(perplexity, "load_wikitext2", lambda: "the cat sat on the mat. " * 20)
+    output = tmp_path / "perplexity.json"
+    options = ["--device", "cpu", "--dtype", "fp32", "--window", "16", "--stride", "8"]
+    args = ["--model", str(tiny_model_dir), *options, "--max-tokens", "50"]
+    assert perplexity.main([*args, "--output", str(output)]) == 0
+
+    result = json.loads(output.read_text())
+    assert result["benchmark"] == "perplexity"
+    assert (result["window"], result["stride"]) == (16, 8)
+    assert (result["tokens"], result["scored_tokens"]) == (50, 49)
+    assert result["dataset"]["revision"] == perplexity.WIKITEXT_REVISION
+    assert result["dataset"]["tokens"] > 50
+    results = result["results"]
+    assert results["reference"] == "float32"
+    assert set(results["models"]) == {"float32", "int8"}
+    assert results["models"]["int8"]["perplexity"] > 1
+    assert 0 <= results["top1_agreement"] <= 1
+    printed = capsys.readouterr().out
+    assert "top-1 agreement" in printed
+    assert f"saved {output}" in printed
