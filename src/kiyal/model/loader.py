@@ -3,7 +3,7 @@ import logging
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Final, Protocol, cast
+from typing import Final, Literal, Protocol, cast, get_args
 
 import torch
 
@@ -15,6 +15,7 @@ from torch import Tensor
 
 from kiyal.model.config import ModelConfig
 from kiyal.model.llama import LlamaModel
+from kiyal.quant.int8 import quantize_linear_layers
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,10 @@ _LAYER_NAMES: Final = {
 }
 _MAX_LISTED_NAMES: Final = 8
 
+# Ways `load_model` can store the linear layers' weights other than in the model dtype.
+Quantization = Literal["int8"]
+QUANTIZATIONS: Final = get_args(Quantization)
+
 
 class CheckpointError(Exception):
     """Raised when checkpoint files are missing or do not match the model."""
@@ -91,6 +96,7 @@ def load_model(
     device: torch.device,
     dtype: torch.dtype,
     revision: str | None = None,
+    quantization: Quantization | None = None,
 ) -> LlamaModel:
     """Builds a model from a Hugging Face checkpoint.
 
@@ -100,11 +106,20 @@ def load_model(
         device: Device to hold the weights.
         dtype: Parameter dtype. Checkpoint tensors are converted on load.
         revision: Branch, tag or commit to download. Only used for Hub repo ids.
+        quantization: "int8" stores the weights of the attention and MLP projections as int8
+            with a scale per output channel (`QuantLinear`). The embedding, the norms and the
+            LM head stay in `dtype`. The weights are quantized after they are loaded, so
+            loading still needs memory for the unquantized model.
 
     Raises:
         CheckpointError: If the checkpoint is missing files or does not match its config.
         ConfigError: If config.json is invalid or describes an unsupported model.
+        ValueError: If the quantization is unknown.
     """
+    if quantization is not None and quantization not in QUANTIZATIONS:
+        raise ValueError(
+            f"unknown quantization {quantization!r}; supported: {', '.join(QUANTIZATIONS)}"
+        )
     model_dir = resolve_model_dir(model, revision=revision)
     config_path = model_dir / CONFIG_FILE
     if not config_path.is_file():
@@ -112,6 +127,12 @@ def load_model(
     llama = LlamaModel(ModelConfig.from_file(config_path), device=device, dtype=dtype)
     llama.requires_grad_(False)
     load_weights(llama, model_dir)
+    if quantization == "int8":
+        # The LM head stays in the model dtype. It is tied to the embedding in models such as
+        # SmolLM2, so an int8 head would be a second copy next to the embedding, and its
+        # error goes straight into the logits.
+        replaced = quantize_linear_layers(llama, skip={"lm_head"})
+        logger.info("quantized %d linear layers to int8", len(replaced))
     return llama.eval()
 
 

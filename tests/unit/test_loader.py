@@ -1,14 +1,16 @@
 import shutil
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import torch
 from safetensors.torch import load_file, save_file
-from torch import Tensor
+from torch import Tensor, nn
 
 from kiyal.model import loader
 from kiyal.model.loader import CheckpointError, checkpoint_name_map, load_model
+from kiyal.quant.int8 import QuantLinear, quantize_per_channel
 
 CPU = torch.device("cpu")
 
@@ -101,6 +103,72 @@ def test_model_is_ready_for_inference(tiny_checkpoint: Path) -> None:
     model = load_model(tiny_checkpoint, device=CPU, dtype=torch.float32)
     assert not model.training
     assert not any(p.requires_grad for p in model.parameters())
+
+
+PROJECTIONS = [
+    "attn.q_proj",
+    "attn.k_proj",
+    "attn.v_proj",
+    "attn.o_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+]
+
+
+def test_int8_quantizes_the_projections_of_every_layer(tiny_checkpoint: Path) -> None:
+    model = load_model(tiny_checkpoint, device=CPU, dtype=torch.float32, quantization="int8")
+    tensors = checkpoint_tensors(tiny_checkpoint)
+    checkpoint_name_of = {
+        param: name for name, param in checkpoint_name_map(model.config.num_hidden_layers).items()
+    }
+    for i in range(model.config.num_hidden_layers):
+        for projection in PROJECTIONS:
+            name = f"layers.{i}.{projection}"
+            layer = model.get_submodule(name)
+            assert isinstance(layer, QuantLinear), name
+            values, scale = quantize_per_channel(tensors[checkpoint_name_of[f"{name}.weight"]])
+            assert torch.equal(layer.weight, values), name
+            assert torch.equal(layer.scale, scale), name
+    assert type(model.lm_head) is nn.Linear
+    assert model.lm_head.weight is model.embed_tokens.weight
+    assert model.embed_tokens.weight.dtype == torch.float32
+    assert not model.training
+
+
+def test_int8_model_is_close_to_the_float_model(tiny_checkpoint: Path) -> None:
+    float_model = load_model(tiny_checkpoint, device=CPU, dtype=torch.float32)
+    int8_model = load_model(tiny_checkpoint, device=CPU, dtype=torch.float32, quantization="int8")
+    generator = torch.Generator().manual_seed(0)
+    input_ids = torch.randint(0, float_model.config.vocab_size, (2, 16), generator=generator)
+    positions = torch.arange(16).expand(2, 16)
+    every_token = torch.arange(32)
+    with torch.inference_mode():
+        expected = float_model(input_ids, positions, every_token)
+        actual = int8_model(input_ids, positions, every_token)
+    assert not torch.equal(actual, expected)
+    # Measured: at most 0.058 apart, on logits of up to 3.5 in magnitude (std 0.81).
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0.15)
+
+
+def test_int8_keeps_an_untied_lm_head_and_biases_in_the_model_dtype(
+    make_tiny_checkpoint: Callable[..., Path],
+) -> None:
+    checkpoint = make_tiny_checkpoint(tie_word_embeddings=False, attention_bias=True)
+    model = load_model(checkpoint, device=CPU, dtype=torch.float16, quantization="int8")
+    tensors = checkpoint_tensors(checkpoint)
+    assert type(model.lm_head) is nn.Linear
+    assert torch.equal(model.lm_head.weight, tensors["lm_head.weight"].half())
+    q_proj = model.get_submodule("layers.0.attn.q_proj")
+    assert isinstance(q_proj, QuantLinear)
+    assert q_proj.scale.dtype == torch.float16
+    assert q_proj.bias is not None
+    assert torch.equal(q_proj.bias, tensors["model.layers.0.self_attn.q_proj.bias"].half())
+
+
+def test_unknown_quantization_raises(tiny_checkpoint: Path) -> None:
+    with pytest.raises(ValueError, match="unknown quantization 'int4'; supported: int8"):
+        load_model(tiny_checkpoint, device=CPU, dtype=torch.float32, quantization=cast(Any, "int4"))
 
 
 def test_missing_tensors_are_named(tiny_checkpoint: Path, tmp_path: Path) -> None:
