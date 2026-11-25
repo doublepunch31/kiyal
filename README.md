@@ -33,6 +33,10 @@ Early development. Implemented so far:
   that request's blocks and runs only the rest of its prompt. Blocks that no request holds stay
   cached until their memory is needed, the least recently used first, and requests that start
   in the same step share the blocks the first of them computes
+- weight-only int8 quantization (`--quantization int8`): the attention and MLP weights are stored
+  as int8 with one scale per output channel, so SmolLM2-135M's weights take 0.61 times their fp16
+  memory, for a 0.17% rise in WikiText-2 perplexity. Each layer converts its weight back before
+  the matmul, so decoding is slower, not faster
 - `kiyal generate`, which streams text decoded with the KV cache. The loop that recomputes the
   whole sequence at every step is kept as the baseline for tests and benchmarks.
 - an OpenAI-compatible HTTP server, `kiyal serve`: `/v1/completions` and `/v1/chat/completions`,
@@ -119,8 +123,8 @@ options.
 ## Benchmarks
 
 All numbers below were measured on a laptop (Apple M4): the KV cache, static batching, prefix
-caching and serving runs on battery power, the continuous batching and paged cache runs on AC
-power. None are NVIDIA GPU numbers.
+caching and serving runs on battery power, the continuous batching, paged cache and int8 speed
+runs on AC power. None are NVIDIA GPU numbers.
 
 ### KV cache
 
@@ -436,6 +440,70 @@ session gave 179 and 154 tokens/s (table above).
 Throughput varied by at most 4% between the runs of a Kiyal server. The p99 TTFT, close to the
 slowest of 64 requests, varied by up to 41%, but each comparison above holds in every run.
 
+### Int8 weights
+
+The attention and MLP projections of every layer stored as int8 with one scale per output
+channel (`--quantization int8`), against the model in its own dtype. The embedding and the LM
+head, one shared tensor in SmolLM2, keep the model dtype. Decoding speed is static batching of
+128-token prompts with 128 greedy output tokens, median of 3 runs. Perplexity covers the
+WikiText-2 test split (304,985 tokens) in windows of 1024 tokens with a stride of 512, so every
+scored token sees at least 512 tokens before it; top-1 agreement is the share of those positions
+where both models' most likely next token is the same.
+
+On the M4 GPU through MPS (fp16):
+
+![Weight memory, decoding speed and perplexity of fp16 and int8 weights on the M4 GPU](benchmarks/results/quantization-mps.png)
+
+| weights | weight MB | x | allocated MB | WikiText-2 perplexity | x | top-1 agreement |
+|---|---|---|---|---|---|---|
+| float16 | 269.0 | 1.00 | 271.1 | 16.596 | 1.0000 | - |
+| int8 | 163.2 | 0.61 | 165.3 | 16.624 | 1.0017 | 97.2% |
+
+| batch size | float16 tokens/s | int8 tokens/s | x | float16 step ms | int8 step ms | float16 TTFT ms | int8 TTFT ms |
+|---|---|---|---|---|---|---|---|
+| 1 | 105.6 | 29.0 | 0.27 | 9.3 | 34.3 | 31 | 59 |
+| 4 | 317.5 | 98.3 | 0.31 | 11.8 | 40.2 | 73 | 111 |
+| 16 | 782.8 | 226.0 | 0.29 | 18.5 | 68.0 | 268 | 419 |
+| 64 | 1539.9 | 708.3 | 0.46 | 30.7 | 74.0 | 1422 | 2125 |
+
+The int8 weights take 0.61 times the memory of fp16 (163 against 269 MB): the projections, 79% of
+the parameters, shrink by half, and the embedding stays in fp16. Perplexity rises by 0.17%, from
+16.596 to 16.624, and the two models pick the same next token at 97.2% of positions.
+
+Decoding is 2.2 to 3.7 times slower. Each layer converts its whole int8 weight back to fp16
+before the matmul, at every step, so where fp16 reads each weight once per step, int8 reads one
+byte, writes two and reads those two again. On MPS the multiplication by the per-row scale is the
+costly part: in a microbenchmark it took about 200 µs for a 1536 x 576 weight, against 8 to 28 µs
+for the matmul itself. At batch 64 more rows share each conversion and int8 reaches 0.46 times
+fp16's throughput, and in the perplexity run's 1024-token windows the forward passes took only
+16% longer. From batch 4 to 16 the int8 step grows by 28 ms against 7 ms for fp16; that has not
+been profiled yet.
+
+On the CPU (fp32, 4 threads):
+
+| weights | weight MB | x | allocated MB | WikiText-2 perplexity | x | top-1 agreement |
+|---|---|---|---|---|---|---|
+| float32 | 538.1 | 1.00 | - | 16.594 | 1.0000 | - |
+| int8 | 220.2 | 0.41 | - | 16.622 | 1.0017 | 97.2% |
+
+| batch size | float32 tokens/s | int8 tokens/s | x | float32 step ms | int8 step ms | float32 TTFT ms | int8 TTFT ms |
+|---|---|---|---|---|---|---|---|
+| 1 | 65.6 | 26.0 | 0.40 | 14.9 | 37.9 | 62 | 116 |
+| 4 | 90.0 | 45.2 | 0.50 | 43.7 | 87.1 | 143 | 234 |
+| 16 | 339.6 | 172.9 | 0.51 | 42.2 | 87.2 | 644 | 769 |
+| 64 | 686.4 | 485.8 | 0.71 | 70.7 | 108.5 | 2946 | 3080 |
+
+Against fp32 the weights shrink to 0.41 times (220 against 538 MB), and decoding runs at 0.40 to
+0.71 times the speed. The perplexities match the fp16 ones to within 0.02%. The fp32 speeds are
+below those of the static batching table above (65.6 against 92.1 tokens/s at batch 1), with the
+same code, in another session: CPU timings move between sessions, as noted for continuous
+batching.
+
+A matmul kernel that reads the int8 weights directly would avoid the conversion. PyTorch has one
+for the CPU and MPS (`torch._weight_int8pack_mm`); in the same microbenchmark it multiplied one
+row by the 1536 x 576 weight in 9 µs on MPS, about as fast as the fp16 matmul. Kiyal does not
+use it yet.
+
 The result files, the CPU charts and the full tables are in
 [benchmarks/results/](benchmarks/results/).
 
@@ -465,6 +533,11 @@ preempted and recomputed in every arrival order. Prefix caching is the fifth: re
 prompts share their first tokens in several ways, including a prompt that is a whole number of
 blocks and two equal prompts, must again match their prompts decoded alone, at block sizes 1, 4
 and 16, and with a pool small enough that requests are preempted and cached blocks evicted.
+Int8 weights are the sixth step, and the only one allowed to change the outputs, by a bounded
+amount: on the first 16,384 WikiText-2 tokens SmolLM2's perplexity may rise by at most 0.75%
+(measured: 0.21%), and its most likely next token must match the fp32 model's at 95% of positions
+or more (measured: 97.3%). Truncating instead of rounding fails both limits. On the tiny model,
+the int8 model must give through the engine what it gives decoded alone.
 
 The server is tested through HTTP with the `openai` client and the tiny model: errors, streaming,
 chat templates, metrics, and clients that disconnect mid-stream, before their first token, or
@@ -512,6 +585,13 @@ uv run python -m benchmarks.plot serving benchmarks/results/serving-cpu.json \
 # The serving benchmark's baselines as OpenAI-compatible servers of their own: transformers'
 # generate() one request at a time, or Kiyal's static batching with --engine static.
 uv run python -m benchmarks.hf_baseline --model HuggingFaceTB/SmolLM2-135M-Instruct --port 8001
+
+# WikiText-2 perplexity of the model and its int8 version (the dataset downloads on first use),
+# then weight memory and decoding speed of both, then one chart and table of the two results.
+uv run python -m benchmarks.perplexity --model HuggingFaceTB/SmolLM2-135M-Instruct --device cpu
+uv run python -m benchmarks.quantization --model HuggingFaceTB/SmolLM2-135M-Instruct --device cpu
+uv run python -m benchmarks.plot quantization benchmarks/results/quantization-cpu.json \
+    benchmarks/results/perplexity-cpu.json --output benchmarks/results/quantization-cpu
 ```
 
 ## License

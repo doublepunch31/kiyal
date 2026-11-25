@@ -13,11 +13,14 @@ batching or capacity result:
         --output benchmarks/results/capacity-cpu
     uv run python -m benchmarks.plot serving benchmarks/results/serving-cpu.json \
         --output benchmarks/results/serving-cpu
+    uv run python -m benchmarks.plot quantization benchmarks/results/quantization-cpu.json \
+        benchmarks/results/perplexity-cpu.json --output benchmarks/results/quantization-cpu
 """
 
 import argparse
 import itertools
 import json
+import textwrap
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -57,6 +60,10 @@ SERVING_LABELS = {
     "continuous": "continuous batching, KV rows",
     "paged": "continuous batching, paged KV",
 }
+# The unquantized model decodes with static batching, as in the throughput chart, so it keeps
+# that color. Violet, the next free slot, fails the palette validator next to blue (CVD
+# separation 4.5, normal vision 10.5), so int8 takes the slot after it, red.
+QUANT_COLORS = {"reference": STATIC_COLOR, "int8": "#e34948"}
 SURFACE = "#fcfcfb"
 TEXT = "#0b0b0b"
 MUTED_TEXT = "#52514e"
@@ -809,6 +816,208 @@ def plot_serving(result: Result, path: Path) -> Path:
     return path
 
 
+def load_quantization_results(speed_path: Path, perplexity_path: Path) -> tuple[Result, Result]:
+    """Reads a quantization result and the perplexity result of the same model and machine.
+
+    Raises:
+        ValueError: If a file holds another benchmark, or the two runs cannot be compared.
+    """
+    speed = json.loads(speed_path.read_text())
+    perplexity = json.loads(perplexity_path.read_text())
+    if speed.get("benchmark") != "quantization":
+        raise ValueError(f"{speed_path} is not a quantization result")
+    if perplexity.get("benchmark") != "perplexity":
+        raise ValueError(f"{perplexity_path} is not a perplexity result")
+    for key in ("model", "revision"):
+        if speed[key] != perplexity[key]:
+            raise ValueError(f"the results differ in {key}: {speed[key]} vs {perplexity[key]}")
+    for key in COMPARED_ENVIRONMENT:
+        ours, theirs = speed["environment"].get(key), perplexity["environment"].get(key)
+        if ours != theirs:
+            raise ValueError(f"the results differ in {key}: {ours} vs {theirs}")
+    return speed, perplexity
+
+
+def quantization_versions(speed: Result) -> list[tuple[str, str]]:
+    """Returns (role, weights) of each version in a quantization result, the unquantized
+    model first: ("reference", "float16") and ("int8", "int8")."""
+    return [
+        ("int8" if v["weights"] == "int8" else "reference", v["weights"]) for v in speed["results"]
+    ]
+
+
+def quantization_medians(speed: Result, weights: str, metric: str) -> dict[int, float]:
+    """Returns the median of a metric for each batch size of one version."""
+    version = next(v for v in speed["results"] if v["weights"] == weights)
+    return {entry["batch_size"]: entry["median"][metric] for entry in version["results"]}
+
+
+def describe_quantization(speed: Result, perplexity: Result) -> str:
+    """Returns one line naming the model, the machine and both workloads."""
+    environment = speed["environment"]
+    model = str(speed["model"]).rsplit("/", 1)[-1]
+    hardware = environment.get("gpu") or environment["cpu"]
+    repeats = speed["repeats"]
+    runs = "1 run" if repeats == 1 else f"median of {repeats} runs"
+    return (
+        f"{model}, {environment['device']}, {hardware}; static batching, "
+        f"{speed['prompt_tokens']}-token prompts, {speed['output_tokens']} greedy output "
+        f"tokens, {runs}; WikiText-2 test, {perplexity['scored_tokens']:,} tokens in windows "
+        f"of {perplexity['window']}, stride {perplexity['stride']}"
+    )
+
+
+def quantization_table(speed: Result, perplexity: Result) -> str:
+    """Renders memory and perplexity per version, then decoding speed per batch size."""
+    versions = speed["results"]
+    reference_bytes = versions[0]["weight_bytes"]
+    models = perplexity["results"]["models"]
+    reference_perplexity = models[perplexity["results"]["reference"]]["perplexity"]
+    header = [
+        "weights",
+        "weight MB",
+        "x",
+        "allocated MB",
+        "WikiText-2 perplexity",
+        "x",
+        "top-1 agreement",
+    ]
+    lines = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
+    for version in versions:
+        weights = version["weights"]
+        allocated = version["allocated_bytes"]
+        value = models[weights]["perplexity"]
+        agreement = "-" if weights != "int8" else f"{perplexity['results']['top1_agreement']:.1%}"
+        row = [
+            weights,
+            f"{version['weight_bytes'] / 1e6:.1f}",
+            f"{version['weight_bytes'] / reference_bytes:.2f}",
+            "-" if allocated is None else f"{allocated / 1e6:.1f}",
+            f"{value:.3f}",
+            f"{value / reference_perplexity:.4f}",
+            agreement,
+        ]
+        lines.append("| " + " | ".join(row) + " |")
+
+    names = [weights for _, weights in quantization_versions(speed)]
+    reference, quantized = names[0], names[-1]
+    speeds = {name: quantization_medians(speed, name, "output_tokens_per_s") for name in names}
+    steps = {name: quantization_medians(speed, name, "step_s") for name in names}
+    ttfts = {name: quantization_medians(speed, name, "ttft_s") for name in names}
+    header = [
+        "batch size",
+        f"{reference} tokens/s",
+        f"{quantized} tokens/s",
+        "x",
+        f"{reference} step ms",
+        f"{quantized} step ms",
+        f"{reference} TTFT ms",
+        f"{quantized} TTFT ms",
+    ]
+    lines += ["", "| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
+    for size in sorted(speeds[reference]):
+        row = [
+            str(size),
+            f"{speeds[reference][size]:.1f}",
+            f"{speeds[quantized][size]:.1f}",
+            f"{speeds[quantized][size] / speeds[reference][size]:.2f}",
+            f"{steps[reference][size] * 1e3:.1f}",
+            f"{steps[quantized][size] * 1e3:.1f}",
+            f"{ttfts[reference][size] * 1e3:.0f}",
+            f"{ttfts[quantized][size] * 1e3:.0f}",
+        ]
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def plot_quantization(speed: Result, perplexity: Result, path: Path) -> Path:
+    """Draws weight memory, decoding speed against batch size, and perplexity, each for the
+    unquantized and the int8 model."""
+    figure = Figure(figsize=(11.5, 4.6), dpi=160, facecolor=SURFACE)
+    memory_axes, speed_axes, perplexity_axes = figure.subplots(
+        1, 3, gridspec_kw={"width_ratios": [1, 2.2, 1]}
+    )
+    versions = quantization_versions(speed)
+    names = [weights for _, weights in versions]
+    colors = [QUANT_COLORS[role] for role, _ in versions]
+    labels = [f"{weights} weights" for weights in names]
+
+    weight_mb = [v["weight_bytes"] / 1e6 for v in speed["results"]]
+    _draw_bars(memory_axes, names, weight_mb, colors, [f"{mb:.0f} MB" for mb in weight_mb])
+    _style_bar_axes(memory_axes, "Weight memory in MB")
+    memory_axes.set_xlabel(
+        f"int8 x{weight_mb[-1] / weight_mb[0]:.2f}", color=MUTED_TEXT, fontsize=9
+    )
+
+    end_labels: list[tuple[int, float, str]] = []
+    for name, color, label in zip(names, colors, labels, strict=True):
+        speeds = quantization_medians(speed, name, "output_tokens_per_s")
+        _draw_series(speed_axes, speeds, color, label, None)
+        largest = max(speeds)
+        end_labels.append((largest, speeds[largest], f"{speeds[largest]:,.0f}"))
+    sizes = sorted(quantization_medians(speed, names[0], "output_tokens_per_s"))
+    _style_axes(speed_axes, sizes, "Output tokens per second, static batching", "batch size")
+    speed_axes.set_ylim(bottom=0)
+    _spread_end_labels(speed_axes, end_labels)
+
+    models = perplexity["results"]["models"]
+    values = [models[name]["perplexity"] for name in names]
+    _draw_bars(perplexity_axes, names, values, colors, [f"{value:.2f}" for value in values])
+    _style_bar_axes(perplexity_axes, "WikiText-2 perplexity")
+    # The bars of nearly equal perplexities look alike, so the difference is spelled out.
+    perplexity_axes.set_xlabel(
+        f"int8 {perplexity['results']['perplexity_increase']:+.2%}; same top token\n"
+        f"at {perplexity['results']['top1_agreement']:.1%} of positions",
+        color=MUTED_TEXT, fontsize=9,
+    )  # fmt: skip
+
+    handles, legend_labels = speed_axes.get_legend_handles_labels()
+    figure.legend(
+        handles, legend_labels, frameon=False, labelcolor=TEXT, fontsize=8.5,
+        loc="upper left", bbox_to_anchor=(0.055, 0.835), ncol=len(legend_labels),
+    )  # fmt: skip
+    figure.suptitle(
+        "Int8 weights: memory, speed and perplexity",
+        x=0.06, y=0.97, ha="left", color=TEXT, fontsize=13, fontweight="bold",
+    )  # fmt: skip
+    # Two workloads make a long description, so it is wrapped instead of running off the edge.
+    description = textwrap.fill(describe_quantization(speed, perplexity), width=140)
+    figure.text(0.06, 0.915, description, color=MUTED_TEXT, fontsize=8.5, va="top")
+    figure.subplots_adjust(left=0.07, right=0.97, top=0.67, bottom=0.16, wspace=0.3)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path)
+    return path
+
+
+def _draw_bars(
+    axes: Axes, names: Sequence[str], values: Sequence[float], colors: Sequence[str],
+    texts: Sequence[str],
+) -> None:  # fmt: skip
+    positions = list(range(len(names)))
+    axes.bar(positions, values, width=0.55, color=colors)
+    for position, value, text in zip(positions, values, texts, strict=True):
+        # The bar carries the color; its value stays in the text color.
+        axes.annotate(
+            text, (position, value), xytext=(0, 4), textcoords="offset points",
+            ha="center", va="bottom", color=TEXT, fontsize=9,
+        )  # fmt: skip
+    axes.set_xticks(positions, list(names))
+    axes.set_xlim(-0.6, len(names) - 0.4)
+    # Bars start at zero, so their heights compare as ratios, with room above for the values.
+    axes.set_ylim(0, max(values) * 1.18)
+
+
+def _style_bar_axes(axes: Axes, title: str) -> None:
+    axes.set_facecolor(SURFACE)
+    axes.set_title(title, loc="left", color=TEXT, fontsize=10, pad=24)
+    axes.grid(axis="y", color=GRID, linewidth=0.8)
+    axes.set_axisbelow(True)
+    axes.tick_params(colors=MUTED_TEXT, labelsize=9, length=0)
+    for side in ("top", "right", "left"):
+        axes.spines[side].set_visible(False)
+    axes.spines["bottom"].set_color(GRID)
+
+
 def _seconds(value: float) -> str:
     return f"{value * 1000:.0f} ms" if value < 1 else f"{value:.3g} s"
 
@@ -916,6 +1125,9 @@ def build_parser() -> argparse.ArgumentParser:
     prefix.add_argument("result", type=Path, help="prefix caching result file")
     serving = commands.add_parser("serving", help="servers under Poisson arrivals")
     serving.add_argument("result", type=Path, help="serving result file")
+    quantization = commands.add_parser("quantization", help="int8 against unquantized weights")
+    quantization.add_argument("result", type=Path, help="quantization result file")
+    quantization.add_argument("perplexity", type=Path, help="perplexity result file")
     for command in commands.choices.values():
         command.add_argument(
             "--output", type=Path, required=True, help="path of the chart and table, without suffix"
@@ -949,10 +1161,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = load_prefix_result(args.result)
         plot_prefix(result, chart)
         table.write_text(f"{describe_prefix(result)}\n\n{prefix_table(result)}")
-    else:
+    elif args.command == "serving":
         result = load_serving_result(args.result)
         plot_serving(result, chart)
         table.write_text(f"{describe_serving(result)}\n\n{serving_table(result)}")
+    else:
+        speed, perplexity = load_quantization_results(args.result, args.perplexity)
+        plot_quantization(speed, perplexity, chart)
+        description = describe_quantization(speed, perplexity)
+        table.write_text(f"{description}\n\n{quantization_table(speed, perplexity)}")
     print(f"saved {chart}")
     print(f"saved {table}")
     return 0

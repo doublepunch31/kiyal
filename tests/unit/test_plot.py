@@ -579,3 +579,141 @@ def test_main_writes_the_serving_chart_and_table(
     assert chart.read_bytes().startswith(PNG_SIGNATURE)
     assert table.read_text() == f"{plot.describe_serving(servers)}\n\n{plot.serving_table(servers)}"
     assert capsys.readouterr().out == f"saved {chart}\nsaved {table}\n"
+
+
+ENVIRONMENT = {"device": "cpu", "dtype": "float32", "cpu": "Test CPU", "torch": "2.15.0"}
+
+
+def quantization_result(speeds: dict[str, tuple[float, float]]) -> plot.Result:
+    """A quantization result in the shape that benchmarks.quantization saves. Each version
+    gets its output tokens/s at batch sizes 1 and 4, and a step time that follows from it."""
+
+    def version(weights: str, values: tuple[float, float]) -> dict[str, object]:
+        return {
+            "weights": weights,
+            "weight_bytes": 200_000_000 if weights == "float32" else 50_000_000,
+            "allocated_bytes": None,
+            "results": [
+                {
+                    "batch_size": size,
+                    "runs": [],
+                    "median": {
+                        "output_tokens_per_s": tokens,
+                        "step_s": size / tokens,
+                        "ttft_s": 0.05 * size,
+                        "total_s": 1.0,
+                    },
+                }
+                for size, tokens in zip((1, 4), values, strict=True)
+            ],
+        }
+
+    return {
+        "benchmark": "quantization",
+        "engine": "static",
+        "model": "org/tiny-model",
+        "revision": None,
+        "prompt_tokens": 128,
+        "output_tokens": 128,
+        "repeats": 3,
+        "warmup": 1,
+        "environment": ENVIRONMENT,
+        "results": [version(weights, values) for weights, values in speeds.items()],
+    }
+
+
+def perplexity_result(reference: float, int8: float) -> plot.Result:
+    return {
+        "benchmark": "perplexity",
+        "model": "org/tiny-model",
+        "revision": None,
+        "window": 1024,
+        "stride": 512,
+        "tokens": 10000,
+        "scored_tokens": 9999,
+        "environment": ENVIRONMENT,
+        "results": {
+            "reference": "float32",
+            "models": {
+                "float32": {"perplexity": reference, "mean_nll": 2.9, "forward_s": 1.0},
+                "int8": {"perplexity": int8, "mean_nll": 2.9, "forward_s": 1.5},
+            },
+            "perplexity_increase": int8 / reference - 1,
+            "top1_agreement": 0.97,
+        },
+    }
+
+
+@pytest.fixture
+def quantized() -> tuple[plot.Result, plot.Result]:
+    speed = quantization_result({"float32": (100.0, 300.0), "int8": (50.0, 240.0)})
+    return speed, perplexity_result(18.0, 18.09)
+
+
+def test_quantization_results_are_loaded_together(
+    tmp_path: Path, quantized: tuple[plot.Result, plot.Result]
+) -> None:
+    speed, perplexity = quantized
+    speed_path = write(tmp_path / "q.json", speed)
+    perplexity_path = write(tmp_path / "p.json", perplexity)
+    assert plot.load_quantization_results(speed_path, perplexity_path) == quantized
+    with pytest.raises(ValueError, match="not a quantization result"):
+        plot.load_quantization_results(perplexity_path, perplexity_path)
+    with pytest.raises(ValueError, match="not a perplexity result"):
+        plot.load_quantization_results(speed_path, speed_path)
+
+
+def test_quantization_results_from_different_devices_raise(
+    tmp_path: Path, quantized: tuple[plot.Result, plot.Result]
+) -> None:
+    speed, perplexity = quantized
+    other = perplexity | {"environment": ENVIRONMENT | {"device": "mps", "dtype": "float16"}}
+    with pytest.raises(ValueError, match="the results differ in device: cpu vs mps"):
+        plot.load_quantization_results(
+            write(tmp_path / "q.json", speed), write(tmp_path / "p.json", other)
+        )
+
+
+def test_the_quantization_table_lists_memory_perplexity_and_speed(
+    quantized: tuple[plot.Result, plot.Result],
+) -> None:
+    lines = plot.quantization_table(*quantized).splitlines()
+    assert lines[0] == (
+        "| weights | weight MB | x | allocated MB | WikiText-2 perplexity | x | top-1 agreement |"
+    )
+    assert lines[2:4] == [
+        "| float32 | 200.0 | 1.00 | - | 18.000 | 1.0000 | - |",
+        "| int8 | 50.0 | 0.25 | - | 18.090 | 1.0050 | 97.0% |",
+    ]
+    assert lines[5] == (
+        "| batch size | float32 tokens/s | int8 tokens/s | x | float32 step ms | int8 step ms | "
+        "float32 TTFT ms | int8 TTFT ms |"
+    )
+    assert lines[7:] == [
+        "| 1 | 100.0 | 50.0 | 0.50 | 10.0 | 20.0 | 50 | 50 |",
+        "| 4 | 300.0 | 240.0 | 0.80 | 13.3 | 16.7 | 200 | 200 |",
+    ]
+
+
+def test_the_quantization_description_names_both_workloads(
+    quantized: tuple[plot.Result, plot.Result],
+) -> None:
+    assert plot.describe_quantization(*quantized) == (
+        "tiny-model, cpu, Test CPU; static batching, 128-token prompts, 128 greedy output "
+        "tokens, median of 3 runs; WikiText-2 test, 9,999 tokens in windows of 1024, stride 512"
+    )
+
+
+def test_main_writes_the_quantization_chart_and_table(
+    tmp_path: Path, quantized: tuple[plot.Result, plot.Result], capsys: pytest.CaptureFixture[str]
+) -> None:
+    speed, perplexity = quantized
+    output = tmp_path / "quantization-cpu"
+    paths = [str(write(tmp_path / "q.json", speed)), str(write(tmp_path / "p.json", perplexity))]
+    assert plot.main(["quantization", *paths, "--output", str(output)]) == 0
+    chart = output.with_name("quantization-cpu.png")
+    table = output.with_name("quantization-cpu.md")
+    assert chart.read_bytes().startswith(PNG_SIGNATURE)
+    description = plot.describe_quantization(speed, perplexity)
+    assert table.read_text() == f"{description}\n\n{plot.quantization_table(speed, perplexity)}"
+    assert capsys.readouterr().out == f"saved {chart}\nsaved {table}\n"

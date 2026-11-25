@@ -8,7 +8,16 @@ from pathlib import Path
 import pytest
 import torch
 
-from benchmarks import batching, capacity, latency, perplexity, prefix, serving, throughput
+from benchmarks import (
+    batching,
+    capacity,
+    latency,
+    perplexity,
+    prefix,
+    quantization,
+    serving,
+    throughput,
+)
 from benchmarks.common import REPO_ROOT, capture_environment, median, percentile, save_result
 from benchmarks.latency import build_prompt
 from kiyal.config import EngineConfig
@@ -806,4 +815,50 @@ def test_perplexity_main_saves_a_result_file(
     assert 0 <= results["top1_agreement"] <= 1
     printed = capsys.readouterr().out
     assert "top-1 agreement" in printed
+    assert f"saved {output}" in printed
+
+
+def test_weight_bytes_count_a_tied_weight_once(tiny_model_dir: Path) -> None:
+    model = load_model(tiny_model_dir, device=CPU, dtype=torch.float32)
+    assert model.lm_head.weight is model.embed_tokens.weight
+    expected = sum(p.numel() for p in model.parameters()) * 4
+    assert quantization.weight_bytes(model) == expected
+
+
+def test_int8_weights_take_a_byte_per_projection_weight(tiny_model_dir: Path) -> None:
+    float_model = load_model(tiny_model_dir, device=CPU, dtype=torch.float32)
+    int8_model = load_model(tiny_model_dir, device=CPU, dtype=torch.float32, quantization="int8")
+    projections = sum(
+        p.numel() for name, p in float_model.named_parameters() if name.endswith("proj.weight")
+    )
+    # Each projection weight shrinks from 4 bytes to 1, plus one 4-byte scale per row.
+    rows = sum(
+        p.shape[0] for name, p in float_model.named_parameters() if name.endswith("proj.weight")
+    )
+    assert quantization.weight_bytes(int8_model) == (
+        quantization.weight_bytes(float_model) - 3 * projections + 4 * rows
+    )
+
+
+def test_quantization_main_saves_a_result_file(
+    tiny_model_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "quantization.json"
+    options = ["--device", "cpu", "--dtype", "fp32", "--prompt-tokens", "8", "--output-tokens", "4"]
+    runs = ["--batch-sizes", "1", "2", "--repeats", "1", "--warmup", "0"]
+    args = ["--model", str(tiny_model_dir), *options, *runs, "--output", str(output)]
+    assert quantization.main(args) == 0
+
+    result = json.loads(output.read_text())
+    assert result["benchmark"] == "quantization"
+    assert (result["prompt_tokens"], result["output_tokens"]) == (8, 4)
+    versions = result["results"]
+    assert [v["weights"] for v in versions] == ["float32", "int8"]
+    assert versions[1]["weight_bytes"] < versions[0]["weight_bytes"]
+    # Nothing is allocated through a GPU allocator on the CPU.
+    assert [v["allocated_bytes"] for v in versions] == [None, None]
+    for version in versions:
+        assert [entry["batch_size"] for entry in version["results"]] == [1, 2]
+    printed = capsys.readouterr().out
+    assert "int8: weights" in printed
     assert f"saved {output}" in printed
